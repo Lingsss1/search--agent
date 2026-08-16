@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+artifacts/
+checkpoints/
+data/raw/
+data/corpus*.jsonl
+data/indexes/
+predictions*.jsonl
+metrics*.json
+reward_audit*.jsonl
+
