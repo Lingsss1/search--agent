@@ -1,0 +1,56 @@
+diff --git a/areal/models/tree_attn/validation.py b/areal/models/tree_attn/validation.py
+new file mode 100644
+index 0000000..65c3ff6
+--- /dev/null
++++ b/areal/models/tree_attn/validation.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from __future__ import annotations
++
++from typing import Any
++
++
++def validate_tree_training_model_config(
++    model_config: Any,
++    *,
++    enabled: bool,
++) -> None:
++    """Reject model layouts that FSDP tree attention cannot preserve.
++
++    FSDP tree training replaces the full-attention kernel with a branch-aware
++    implementation.  Stateful or local-attention layers still consume the
++    flattened trie as an ordinary sequence, so allowing them would silently
++    mix state between sibling branches.  Hugging Face hybrid models expose
++    their per-layer implementations through ``layer_types`` on either the
++    outer config or ``text_config``.
++    """
++
++    if not enabled:
++        return
++
++    configs = [model_config]
++    text_config = getattr(model_config, "text_config", None)
++    if text_config is not None and text_config is not model_config:
++        configs.append(text_config)
++
++    layer_types: list[str] = []
++    for config in configs:
++        configured = getattr(config, "layer_types", None)
++        if configured:
++            layer_types.extend(str(layer_type) for layer_type in configured)
++
++    unsupported = sorted(set(layer_types) - {"full_attention"})
++    if unsupported:
++        model_type = getattr(
++            text_config or model_config,
++            "model_type",
++            type(model_config).__name__,
++        )
++        raise ValueError(
++            "FSDP tree training is unsafe for hybrid model "
++            f"{model_type!r}: unsupported layer_types={unsupported}. "
++            "The current tree implementation makes only full-attention layers "
++            "branch-aware; recurrent, linear, or local layers would mix state "
++            "between flattened trie branches. Disable enable_tree_training."
++        )

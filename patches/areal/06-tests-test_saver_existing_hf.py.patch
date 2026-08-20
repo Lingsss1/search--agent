@@ -1,0 +1,102 @@
+diff --git a/tests/test_saver_existing_hf.py b/tests/test_saver_existing_hf.py
+new file mode 100644
+index 0000000..d216c64
+--- /dev/null
++++ b/tests/test_saver_existing_hf.py
+@@ -0,0 +1,96 @@
++from pathlib import Path
++from types import SimpleNamespace
++
++from areal.api import FinetuneSpec
++from areal.api.cli_args import SaverConfig
++from areal.utils.saver import Saver
++from areal.trainer.rl_trainer import PPOTrainer
++
++
++def _saver(tmp_path: Path, *, freq_steps: int | None) -> Saver:
++    config = SaverConfig(
++        experiment_name="exp",
++        trial_name="trial",
++        fileroot=str(tmp_path),
++        freq_epochs=None,
++        freq_steps=freq_steps,
++        freq_secs=None,
++        mode="sync",
++    )
++    spec = FinetuneSpec(
++        total_train_epochs=1,
++        dataset_size=16,
++        train_batch_size=8,
++    )
++    return Saver(config, spec)
++
++
++def test_save_existing_hf_publishes_scheduled_adapter(tmp_path):
++    source = tmp_path / "weight_update_v1"
++    source.mkdir()
++    (source / "adapter_config.json").write_text("{}", encoding="utf-8")
++    (source / "adapter_model.safetensors").write_bytes(b"adapter")
++
++    saver = _saver(tmp_path, freq_steps=1)
++    assert saver.save_existing_hf(str(source), 0, 0, 0)
++
++    destination = (
++        tmp_path
++        / "checkpoints"
++        / "root"
++        / "exp"
++        / "trial"
++        / "default"
++        / "epoch0epochstep0globalstep0"
++    )
++    assert (destination / "adapter_config.json").read_text(encoding="utf-8") == "{}"
++    assert (destination / "adapter_model.safetensors").read_bytes() == b"adapter"
++
++
++def test_save_existing_hf_honors_disabled_schedule(tmp_path):
++    source = tmp_path / "weight_update_v1"
++    source.mkdir()
++
++    saver = _saver(tmp_path, freq_steps=None)
++    assert not saver.save_existing_hf(str(source), 0, 0, 0)
++    assert not (tmp_path / "checkpoints").exists()
++
++
++def test_ppo_hf_save_reuses_disk_lora_without_actor_export(tmp_path):
++    source = tmp_path / "weight_update_v1"
++    source.mkdir()
++
++    class _WeightMeta:
++        type = "disk"
++        use_lora = True
++
++        @staticmethod
++        def with_version(version):
++            assert version == 1
++            return SimpleNamespace(path=str(source))
++
++    class _FakeSaver:
++        is_async = True
++
++        def __init__(self):
++            self.existing_calls = []
++            self.actor_calls = []
++
++        def save_existing_hf(self, *args):
++            self.existing_calls.append(args)
++
++        def save(self, *args, **kwargs):
++            self.actor_calls.append((args, kwargs))
++
++    trainer = object.__new__(PPOTrainer)
++    trainer.weight_update_meta = _WeightMeta()
++    trainer.saver = _FakeSaver()
++    trainer.actor = object()
++    trainer.critic = None
++    trainer.tokenizer = None
++    trainer.processor = None
++
++    trainer._save_hf(epoch=0, epoch_step=0, global_step=0)
++
++    assert trainer.saver.existing_calls == [(str(source), 0, 0, 0)]
++    assert trainer.saver.actor_calls == []

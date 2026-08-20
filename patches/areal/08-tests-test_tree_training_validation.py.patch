@@ -1,0 +1,48 @@
+diff --git a/tests/test_tree_training_validation.py b/tests/test_tree_training_validation.py
+new file mode 100644
+index 0000000..5cd8775
+--- /dev/null
++++ b/tests/test_tree_training_validation.py
+@@ -0,0 +1,42 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from types import SimpleNamespace
++
++import pytest
++
++from areal.models.tree_attn.validation import validate_tree_training_model_config
++
++
++def test_tree_training_accepts_full_attention_model() -> None:
++    config = SimpleNamespace(
++        model_type="full_attention_test",
++        layer_types=["full_attention", "full_attention"],
++    )
++
++    validate_tree_training_model_config(config, enabled=True)
++
++
++def test_tree_training_accepts_legacy_config_without_layer_types() -> None:
++    validate_tree_training_model_config(
++        SimpleNamespace(model_type="legacy_full_attention"),
++        enabled=True,
++    )
++
++
++def test_tree_training_rejects_hybrid_text_config() -> None:
++    config = SimpleNamespace(
++        model_type="wrapper",
++        text_config=SimpleNamespace(
++            model_type="qwen3_5_text",
++            layer_types=["linear_attention", "full_attention"],
++        ),
++    )
++
++    with pytest.raises(ValueError, match="linear_attention"):
++        validate_tree_training_model_config(config, enabled=True)
++
++
++def test_tree_training_validation_is_noop_when_disabled() -> None:
++    config = SimpleNamespace(layer_types=["linear_attention"])
++
++    validate_tree_training_model_config(config, enabled=False)

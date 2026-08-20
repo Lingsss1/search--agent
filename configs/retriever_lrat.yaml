@@ -1,0 +1,23 @@
+{
+  "kind": "retriever",
+  "model": "Qwen/Qwen3-Embedding-0.6B",
+  "model_revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+  "dataset": "Yuqi-Zhou/LRAT-Train",
+  "dataset_revision": "26df12d39ec3eb65a30a61d86664931bb0fa4359",
+  "official_checkpoint": "Yuqi-Zhou/LRAT-Qwen3-Embedding-0.6B",
+  "official_checkpoint_revision": "81c339a83d4407454e59c8069b0720493e3451a6",
+  "query_length": 128,
+  "document_length": 512,
+  "global_batch_size": 128,
+  "learning_rate": 0.00002,
+  "warmup_ratio": 0.05,
+  "epochs": 1,
+  "temperature": 0.02,
+  "query_instruction": "Given a web search query, retrieve relevant passages that answer the query",
+  "precision": "bf16",
+  "reweight_clip": [0.5, 2.0],
+  "positives": "satisfied=true",
+  "negatives": "original_hard_negatives",
+  "frozen_during_policy_training": true,
+  "seed": 36
+}

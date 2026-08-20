@@ -1,0 +1,18 @@
+{
+  "retriever_recall_at_20_absolute_gain": 0.03,
+  "external_state_token_reduction_at_same_f1": 0.20,
+  "external_state_f1_gain_at_same_tokens": 2.0,
+  "grpo_f1_gain": 3.0,
+  "grpo_search_reduction_if_quality_stable": 0.15,
+  "citation_validity": 0.98,
+  "citation_precision": 0.85,
+  "require_cost_records": ["main_test", "in_domain_dev", "chinese_test"],
+  "completion_artifacts": [
+    "A-F results",
+    "R0-R4 retriever comparison",
+    "reward audit",
+    "accuracy-token cost curve",
+    "failure cases",
+    "replayable demo"
+  ]
+}

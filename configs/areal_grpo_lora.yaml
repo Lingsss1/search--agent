@@ -1,0 +1,265 @@
+experiment_name: oss36-grpo
+trial_name: trial0
+seed: 36
+enable_offload: false
+total_train_epochs: 1
+tokenizer_path: ${actor.path}
+
+cluster:
+  # Heterogeneous two-node Ray layout: the local 8-GPU A800 node receives two
+  # four-GPU actor bundles; the remaining TP4 rollout bundle lands on H800.
+  n_nodes: 2
+  n_gpus_per_node: 4
+  fileroot: /code/openstatesearch/artifacts/areal
+  name_resolve:
+    type: ray
+    # RayScheduler's RPC worker CLI currently forwards only the repository
+    # type, so all processes must use AReaL's default actor name.
+    ray_actor_name: ray_kv_store
+
+scheduler:
+  type: ray
+
+rollout:
+  # Dense Qwen3.6-27B (registered through the Qwen3.5 implementation) produces
+  # empty/garbled generations with the pinned
+  # SGLang Triton GDN kernel; use AReaL's supported vLLM backend instead.
+  backend: "vllm:d1p1t4"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 64
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  # Protocol-valid trajectories are fragile; do not prefetch future-policy
+  # batches before the current LoRA version has been trained and installed.
+  max_head_offpolicyness: 0
+  # Qwen3.6/vLLM may spend several minutes compiling kernels on a cold H800
+  # node. Keep the remote engine alive long enough to finish initialization.
+  setup_timeout: 900
+  enable_rollout_tracing: false
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 4
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        OSS36_RETRIEVER_URL: http://10.82.124.28:8036
+        AREAL_DISK_WEIGHT_SOURCE: root@10.82.123.139
+        AREAL_DISK_WEIGHT_SSH_PORT: "22222"
+        AREAL_DISK_WEIGHT_SYNC_TIMEOUT: "300"
+        # Do not auto-import the optional AWEX/Megatron plugin in the vLLM
+        # subprocess. AReaL's worker extension is supplied explicitly below.
+        VLLM_PLUGINS: ""
+        no_proxy: 127.0.0.1,localhost,10.82.123.139,10.82.124.28
+        NO_PROXY: 127.0.0.1,localhost,10.82.123.139,10.82.124.28
+  use_lora: true
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  agent:
+    mode: inline
+    export_style: individual
+    turn_discount: 1.0
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 768
+  max_tokens: 8192
+  greedy: false
+  # HF stochastic gate on the frozen SFT checkpoint: 31/32 completed at 0.8
+  # versus 24/32 at 1.0, while retaining four-rollout exploration.
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 20
+  lora_name: oss36-policy
+  # Normalize over the four episodes sampled for the same prompt before
+  # individual turns are exported. Actor-side group normalization would
+  # otherwise weight longer episodes more heavily.
+  reward_normalization: true
+
+eval_gconfig:
+  n_samples: 1
+  min_new_tokens: 0
+  max_new_tokens: 768
+  max_tokens: 8192
+  greedy: true
+  temperature: 1.0
+  top_p: 1.0
+  lora_name: oss36-policy
+
+actor:
+  backend: "fsdp:d8p1t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  # Rollout runs on a different Ray node whose working directory is not
+  # guaranteed to be the project root. Keep model/tokenizer paths absolute so
+  # vLLM never interprets a missing relative path as a Hugging Face repo id.
+  path: /code/openstatesearch/artifacts/policy_sft_step200_legalspace20_merged_seed36
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  # Qwen3.6 has 48 stateful linear-attention/GatedDeltaNet layers. AReaL's
+  # current FSDP tree mask only covers full-attention layers, so tree packing
+  # would mix recurrent state across branches. Keep this explicitly disabled;
+  # the engine also rejects the unsafe combination before model startup.
+  enable_tree_training: false
+  dtype: bfloat16
+  attn_impl: sdpa
+  mb_spec:
+    # This is the total packed-token capacity of one actor forward, not the
+    # context limit of an individual trajectory (which remains 8K).  At 8K,
+    # stochastic individual-turn exports can give every DP rank 18 sequences
+    # while sequence-length fragmentation makes another rank require 28
+    # micro-batches.  FSDP needs the same number of forwards on every rank and
+    # cannot split 18 sequences into 28 non-empty groups.  A 12K packed batch
+    # keeps the observed 18-item shard within the available group count while
+    # leaving materially more memory headroom than the validated 16K smoke.
+    max_tokens_per_mb: 12288
+    packing_algorithm: ffd
+  fsdp:
+    memory_efficient_load: true
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  # Individual multi-turn export makes each sequence one model action. Average
+  # within the action first so JSON/query length cannot change action weight.
+  loss_reduction: sequence_mean
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
+  reward_norm: null
+  # Terminal rewards are already normalized within each prompt group and ABC
+  # process rewards are separately bounded. A second batch-std division would
+  # amplify process credit in all-failure, low-variance batches.
+  adv_norm: null
+  max_new_tokens: ${gconfig.max_new_tokens}
+  weight_update_mode: disk
+  use_lora: ${rollout.use_lora}
+  peft_type: lora
+  lora_rank: 16
+  lora_alpha: 16
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      # Actor workers call the trainer's private callback address during
+      # update_weights.  Bypass cluster HTTP proxies for those internal RPCs.
+      env_vars:
+        no_proxy: 127.0.0.1,localhost,10.82.123.139,10.82.124.28
+        NO_PROXY: 127.0.0.1,localhost,10.82.123.139,10.82.124.28
+
+ref: null
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: 8
+  context_length: 8192
+  mem_fraction_static: 0.45
+  enable_lora: ${actor.use_lora}
+  max_lora_rank: ${actor.lora_rank}
+  max_loaded_loras: 8
+  enable_multimodal: true
+  disable_custom_all_reduce: true
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  # The actor recomputes log-probabilities at gconfig.temperature=0.8. vLLM's
+  # default raw_logprobs are taken before temperature/top-k/top-p and therefore
+  # do not describe the behavior policy. Record the actual sampled
+  # distribution so decoupled PPO corrects only the real truncation/kernel gap.
+  logprobs_mode: processed_logprobs
+  # Avoid the FlashInfer custom all-reduce JIT failure seen on the H800 node;
+  # TP4 still uses NCCL collectives.
+  disable_custom_all_reduce: true
+  # Qwen3.6's Qwen3.5-implementation FlashInfer GDN prefill kernel is JIT
+  # compiled. The Triton
+  # backend starts deterministically and is the recommended escape hatch.
+  gdn_prefill_backend: triton
+  max_model_len: 8192
+  gpu_memory_utilization: 0.8
+  enable_lora: ${rollout.use_lora}
+  max_lora_rank: ${actor.lora_rank}
+
+train_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: data/processed/full_context_seed36/rl_train.jsonl
+  type: rl
+  max_length: 8192
+
+valid_dataset:
+  batch_size: 16
+  shuffle: false
+  pin_memory: true
+  num_workers: 4
+  path: data/processed/full_context_seed36/rl_dev.jsonl
+  type: rl
+  max_length: 8192
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

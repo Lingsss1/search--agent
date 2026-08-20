@@ -4,11 +4,31 @@ OpenStateSearch-36 是一个可复现的多轮搜索 Agent 工程实现。它把
 `SearchState`，使用 BM25 + LRAT Dense 的混合检索，并通过可程序验证的答案、证据、引用和成本奖励训练
 Policy。实现依据为项目实施规范 v1.0。
 
-## 当前实验方案与进度（2026-08-16）
+## 当前进度（2026-08-20）
+
+正式 Phase A 多机 GRPO 已启动，实验为
+`oss36-grpo-a-v8-logprob-fix / processedlogp-from-r21-5steps-gate-r1`。截至
+2026-08-20 11:55（+08:00），已完成 `121/375` 个更新，step 122 正在 actor
+forward/backward；step 120 的非阻塞周期评测已完成，step 200 的 adapter 归档、reward/ABC 审计和 held-out
+联合门控 watcher 均在运行。
+
+当前 50 条 held-out 结果尚未证明持续提升：step 100/110/120 的 answer F1 分别为
+`0.4189 / 0.4407 / 0.4329`，step 120 相比 step 110 的 paired bootstrap 95% CI 为
+`[-0.0598, 0.0430]`。优化器、importance ratio 和 ABC 信用分配审计正常，但训练 reward 不作为质量提升证据；
+正式决策点仍是预先约定的 step-200 checkpoint gate。
+
+完整进度、结果表、关键修复、验证证据与剩余交付项见
+[`PROGRESS_REPORT_2026-08-20.md`](PROGRESS_REPORT_2026-08-20.md)。AReaL 基于固定 upstream commit 的
+可复现修改见 [`patches/areal`](patches/areal/README.md)。当前项目测试为 `98 passed, 0 failed`。
+
+> 状态说明：完整目标尚未完成。Phase A 375 步、Phase B、A--F 矩阵、四个正式数据集、最终 reward audit、
+> failure cases、cost curve、精确回放及 acceptance audit 仍是必需交付项。
+
+## 历史稳定性实验与设计演进（2026-08-17）
 
 ### 目标
 
-当前目标是先验证 Qwen3.5-27B 的多轮 GRPO 是否能稳定学习
+当前目标是先验证 Qwen3.6-27B 的多轮 GRPO 是否能稳定学习
 `SEARCH -> OPEN -> KEEP -> ANSWER`，同时保持动作、状态和引用协议合法；通过短程稳定性门控后，再扩大
 rollout 并完成 Phase A、Phase B 及完整评测矩阵。最终目标是得到答案正确、证据完整、引用准确且搜索成本可控
 的 Search Agent，而不是只降低训练 loss。
@@ -19,8 +39,10 @@ rollout 并完成 Phase A、Phase B 及完整评测矩阵。最终目标是得�
 - Rollout：H800 上运行 vLLM TP4，生成同一策略版本的 on-policy 轨迹。
 - Retriever：另一台 A800 机器提供冻结的 R4 HTTP 检索服务；训练不在 rollout worker 内重复加载 Dense
   模型和索引。
-- Policy：Qwen3.5-27B，LoRA rank 16，仅训练 `q_proj/k_proj/v_proj/o_proj`。
-- 每步：8 prompts × 4 samples，共 32 episodes；每条最多 16 轮工具交互。
+- Policy：Qwen3.6-27B（当前 Transformers 注册为 `Qwen3_5ForConditionalGeneration`），LoRA rank 16，
+  仅训练 `q_proj/k_proj/v_proj/o_proj`。
+- 已验证的稳定性配置每步为 16 prompts × 4 samples，共 64 episodes；每条最多 16 轮工具交互。
+  先前 8-prompt 配置在 actor DP8 上每 rank 只有一个 prompt group，无法稳定平衡展开后的 action 数。
 - 优化：GRPO/PPO，学习率 `1e-6`，`sequence_mean` 动作内 token 归一化，第二次 reward/advantage
   标准化关闭。
 - 稳定性段保持严格同版本轨迹，不跨策略版本预取；确认正确后再扩展 H800 为 DP2×TP4 rollout。
@@ -56,21 +78,66 @@ rollout 并完成 Phase A、Phase B 及完整评测矩阵。最终目标是得�
 
 ### 当前运行状态
 
-r24 正从 `global_step=2` 恢复并重做 step2，目标完成到 step4。actor micro-batch 上限已从 8192 调整为
-10240 tokens，recover 改为每一步保存。截止 2026-08-16 16:11 UTC，新 v2 rollout 已完成，recompute
-log-probability 和 advantage 计算通过了此前的 micro-batch 同步故障点，8×A800 正在执行 PPO 更新。该状态是
-运行快照，不代表 step2 已最终提交或 r24 已完成。
+r24 已完成到逻辑 GRPO update 4；随后 r25 使用 batch 16、actor micro-batch cap 12,288、eager rollout 和
+逐步 recover，再完成两个优化器更新并干净退出。最终合并模型为
+`artifacts/policy_grpo_r25_step6_merged_seed36`，即逻辑 update 6。r25 两个 rollout version 均为 61/64
+联合有效，且 checkpoint、optimizer recover 与 teardown 都成功。
+
+同一批 50 条、temperature=1.0 的 r21/r25 配对评测中，r25 completion 从 84% 提升到 90%，但严格
+token-overlap answer F1 从 0.4324 变为 0.4004。逐样本审计显示均值差为 -0.0320，paired bootstrap 95%
+区间为 `[-0.1451, 0.0788]`，不足以证明真实退化；两边都协议干净的 22 条上均值差为 +0.0243。负差主要受
+2 条 r25 未完成轨迹和 7 条“包含完整 reference 但附带解释”的长度惩罚影响，r25 平均答案长度从 5.22
+增至 8.42 tokens。审计 artifact 为
+`artifacts/eval/grpo_r21_vs_r25_gate50_paired_audit.json`。
+
+扩大到同一批 100 条后，r25 相对 r21 的 answer F1 为 `0.4372 vs 0.4670`，paired bootstrap 95%
+区间仍跨零（`[-0.1155, 0.0554]`），但 completion、support recall、citation precision 和非法 doc 引用
+也都向不利方向变化，且三个数据集的 F1 delta 均为负。因此当前 ABC checkpoint 没有通过“不退化”稳定性
+门槛，不能直接启动完整 Phase A。
+
+中间 r24/update4 的同批 100 条 F1 为 `0.4149`：相对 r21/update1 为 `-0.0521`，而 r25/update6 相对
+r24 回升 `+0.0223`。协议完成率在 r24 达到 0.94，说明主要退化是答案/证据质量而非无法完成 ANSWER，且短程
+变化非单调。ABC 回放显示 95% 以上 episode 有过程信号，过程回报与终局回报相关系数为 0.65--0.68；因此
+问题不是奖励过于稀疏，而更可能是小 batch 更新方差和 rollout/training policy mismatch。配对 artifacts 为
+`artifacts/eval/grpo_r21_vs_r24_gate100_temp10_paired_audit.json` 与
+`artifacts/eval/grpo_r24_vs_r25_gate100_temp10_paired_audit.json`。
+
+为隔离 importance-ratio 下尾，已从 r21 分别完成一次 `[0.5,5]` 双边门控和仅 upper=5 的更新。约
+7.1%--7.3% token ratio 低于 0.5，因此下尾不是装饰性配置；但在相同 50 条 held-out、vLLM TP4、
+temperature=1.0 和逐 prompt/turn 稳定 seed 下，两者都未通过多指标不退化门槛。r21/lower/upper 的 F1 为
+`0.3990/0.4023/0.3916`；lower 相对 r21 的 F1 delta 仅 `+0.00325`，95% CI
+`[-0.0543,0.0637]`，同时 support recall 从 `0.3767` 降至 `0.3550`、citation macro 从 `0.5124`
+降至 `0.4147`、completion 从 `0.94` 降至 `0.92`。upper-only 同样降低 F1、support 和 completion。
+因此当前保留 r21，不再为这组门控做一小时严格同轨迹重跑，也不启动 375 步正式训练。机器可读汇总见
+`artifacts/eval/grpo_v7_icepop_one_step_ablation.json`。
 
 ### 已知问题与下一步
 
-- AReaL 冷启动约 490 秒：actor FSDP 构造约 266 秒，vLLM compile/CUDA graph 约 224 秒。
+- 当前热缓存实测中，27B 权重读取约 40--45 秒；更慢的是 FSDP2 应用/广播约 105--109 秒，以及 eager
+  vLLM rollout worker 初始化约 105 秒。框架已加入 actor 前向/反向 micro-batch 心跳和 ETA，便于区分
+  “仍在计算”与真正卡死。
+- 原评测脚本的 8 个分片会各自加载约 51 GB 权重并重复编译 kernel。现已支持持久化 vLLM TP4 服务；同一
+  greedy 样本与直接 Transformers 路径的 7 个动作、token 数、答案和引用逐字段一致，正式评测可复用服务。
+  H800 实测权重读取仅 4.86--6.36 秒，约两分钟冷启动主要来自 engine/compile/KV-cache/CUDA graph 与
+  多模态 warmup。启动器已分离存储路径和 API served-model-name，并关闭该环境中必然编译失败后回退的
+  FlashInfer allreduce-RMS fusion；三份 matched gate50 均完成且干净释放显存。
+- 同策略版本的 vLLM behavior 与 FSDP/SDPA 重算 log-prob 仍有长尾差异。从 r21 完成的两个单步实验显示，
+  约 7.1%--7.3% token 的 importance ratio 低于 0.5，而超过 5 的不足 0.04%；双边门控确实改变更新，
+  但 held-out 多指标没有改善。框架现已增加逐请求稳定 seed，后续相同版本、prompt、sample index 和 turn
+  可独立于异步请求顺序复现；下一步应先缩小 behavior/recompute 差异，而不是继续调 mask 阈值。
+- 单步训练的主要瓶颈不是 rollout：64 episodes 展开为 595 条 action-level 序列，重复多轮前缀，actor 每步
+  处理约 134 万逻辑 token，其中约 97% 位置被 mask；一次 PPO update 实测 1,250--1,265 秒。直接跑 375
+  步会持续数天。episode packing/前缀复用可能显著提速，但会触及每动作 ABC advantage 的训练语义，必须
+  先做等价性测试和小规模 A/B，不能作为纯工程重构直接启用。
 - 8192-token cap 曾触发跨 rank 的不可行 micro-batch 数：某 rank 只有 16 个 sequence groups，却被同步要求
   执行 20 个非空 micro-batches。
-- 异常后 actor destroy RPC 曾卡住超过 20 分钟。
+- 异常后 actor destroy RPC 曾卡住超过 20 分钟；collective RPC 已改为不重试并有界清理，本轮两次 DP8
+  单步均完成 checkpoint 与 teardown，所有 A800/H800 显存已释放。
 - 上述问题、临时规避和最小框架修复记录在
   [AREAL_RUNTIME_ISSUES.md](AREAL_RUNTIME_ISSUES.md)。
-- r24 step4 完成后：合并最终 LoRA，运行 held-out temperature=1 gate50，并与 SFT、r21 做配对比较；只有
-  合法率、完成率、F1、support recall 和 citation precision 未退化时，才扩展 10--20 步。
+- gate50 统计功效不足，且暴露了结构化 `answer` 字段冗长导致的 F1 长度惩罚。扩大稳定性评测样本并保持
+  checkpoint、prompt、采样参数和检索器 provenance 可配对；只有合法率、完成率、F1、support recall 和
+  citation precision 的更强证据不退化时，才扩展 10--20 步。
 - 稳定性门控通过后再启动完整 Phase A；最终仍需完成 A--F、R0--R4、BrowseComp-Plus、中文零样本评测和
   奖励审计。
 

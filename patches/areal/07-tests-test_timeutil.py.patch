@@ -1,0 +1,31 @@
+diff --git a/tests/test_timeutil.py b/tests/test_timeutil.py
+new file mode 100644
+index 0000000..a315745
+--- /dev/null
++++ b/tests/test_timeutil.py
+@@ -0,0 +1,25 @@
++from unittest.mock import patch
++
++from areal.utils.timeutil import FrequencyControl
++
++
++def test_unsynchronized_frequency_control_never_uses_process_group():
++    """Background timers must not interleave collectives with model training."""
++    control = FrequencyControl(frequency_seconds=0, synchronize=False)
++
++    with (
++        patch("areal.utils.timeutil.dist.is_initialized", return_value=True),
++        patch("areal.utils.timeutil.dist.all_reduce") as all_reduce,
++    ):
++        assert control.check()
++
++    all_reduce.assert_not_called()
++
++
++def test_frequency_control_state_preserves_synchronization_mode():
++    original = FrequencyControl(frequency_seconds=10, synchronize=False)
++    restored = FrequencyControl(frequency_seconds=1)
++
++    restored.load_state_dict(original.state_dict())
++
++    assert restored.synchronize is False

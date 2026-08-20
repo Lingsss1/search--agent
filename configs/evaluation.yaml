@@ -1,0 +1,24 @@
+{
+  "kind": "evaluation",
+  "experiments": {
+    "A": ["transcript", "base_hybrid", "sft"],
+    "B": ["external_state", "base_hybrid", "sft"],
+    "C": ["transcript", "lrat_hybrid", "sft"],
+    "D": ["external_state", "lrat_hybrid", "sft"],
+    "E": ["transcript", "lrat_hybrid", "sft_grpo"],
+    "F": ["external_state", "lrat_hybrid", "sft_grpo"]
+  },
+  "retrievers": {
+    "R0": "bm25",
+    "R1": "qwen3_embedding_base",
+    "R2": "lrat_official",
+    "R3": "lrat_self_trained",
+    "R4": "bm25_lrat_self_trained_rrf"
+  },
+  "in_domain": {"hotpotqa_dev": 500, "2wiki_dev": 500, "musique_dev": 500},
+  "ood": {"browsecomp_plus": 830},
+  "chinese_zero_shot": {"xbench_deepsearch": 100, "browsecomp_zh": 289},
+  "memory_token_budgets": [4096, 8192],
+  "report": ["answer", "evidence", "retrieval", "behavior", "cost"],
+  "seed": 36
+}

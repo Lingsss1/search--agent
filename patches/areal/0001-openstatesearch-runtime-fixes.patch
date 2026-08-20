@@ -1,0 +1,2627 @@
+diff --git a/areal/api/cli_args.py b/areal/api/cli_args.py
+index 5d4a150..25513d5 100644
+--- a/areal/api/cli_args.py
++++ b/areal/api/cli_args.py
+@@ -195,6 +195,15 @@ class GenerationHyperparameters:
+         default=1.0,
+         metadata={"help": "Sampling temperature. Higher values increase diversity."},
+     )
++    seed: int | None = field(
++        default=None,
++        metadata={
++            "help": (
++                "Optional per-request sampling seed. When unset, the inference "
++                "backend uses its process-global random stream."
++            )
++        },
++    )
+     stop_token_ids: list[int] = field(
+         default_factory=list,
+         metadata={"help": "Stop generation when encountering these token IDs."},
+@@ -1772,6 +1781,15 @@ class PPOActorConfig(TrainEngineConfig):
+             "choices": ["token", "sequence"],
+         },
+     )
++    loss_reduction: str = field(
++        default="token_mean",
++        metadata={
++            "help": "How to aggregate the policy loss. 'token_mean' gives every "
++            "generated token equal weight. 'sequence_mean' first averages generated "
++            "tokens within each sequence, then gives every sequence equal weight.",
++            "choices": ["token_mean", "sequence_mean"],
++        },
++    )
+     # Proximal Log-Probability Computation Method
+     prox_logp_method: str = field(
+         default=PROX_LOGP_METHOD_RECOMPUTE,
+@@ -1817,6 +1835,19 @@ class PPOActorConfig(TrainEngineConfig):
+ 
+     def __post_init__(self):
+         """Validate PPO actor configuration."""
++        if self.loss_reduction not in ("token_mean", "sequence_mean"):
++            raise ValueError(
++                "loss_reduction must be 'token_mean' or 'sequence_mean', got "
++                f"{self.loss_reduction!r}"
++            )
++        if self.loss_reduction == "sequence_mean" and (
++            self.use_sapo_loss or self.use_cispo_loss
++        ):
++            raise ValueError(
++                "loss_reduction='sequence_mean' currently supports the PPO "
++                "surrogate only, not SAPO or CISPO"
++            )
++
+         reward_norm = self.reward_norm
+         if isinstance(reward_norm, (dict, DictConfig)):
+             reward_mean_level = reward_norm.get("mean_level")
+@@ -1954,7 +1985,27 @@ class vLLMConfig:
+     skip_tokenizer_init: bool = False
+     enforce_eager: bool = False
+     dtype: str = "bfloat16"
++    # vLLM defaults to raw_logprobs, i.e. values before temperature and all
++    # sampling processors. Online RL jobs that compare behavior log-probs with
++    # temperature-scaled actor recomputation should explicitly select
++    # processed_logprobs so the recorded behavior policy is the distribution
++    # that actually sampled the token.
++    logprobs_mode: str = field(
++        default="raw_logprobs",
++        metadata={
++            "help": "Distribution represented by returned vLLM log-probabilities.",
++            "choices": [
++                "raw_logprobs",
++                "processed_logprobs",
++                "raw_logits",
++                "processed_logits",
++            ],
++        },
++    )
+     distributed_executor_backend: str = "mp"
++    # Fall back to NCCL collectives when vLLM's FlashInfer custom all-reduce
++    # extension is unavailable or too expensive to JIT during a cold start.
++    disable_custom_all_reduce: bool = False
+     # original
+     max_num_seqs: int = 256
+     # kv_cache_type: str = "auto"
+diff --git a/areal/api/io_struct.py b/areal/api/io_struct.py
+index abb6407..2ee4c17 100644
+--- a/areal/api/io_struct.py
++++ b/areal/api/io_struct.py
+@@ -124,9 +124,13 @@ class ModelResponse:
+                 else:
+                     break
+             if pad_or_eos_len == len(self.output_tokens):
+-                raise ValueError(
+-                    "All output_tokens are EOS or PAD tokens; cannot strip stop tokens without removing entire output."
+-                )
++                # A model is allowed to terminate immediately.  Its visible
++                # completion is empty, while the EOS/PAD token and log-prob
++                # remain in ``output_tokens`` for policy training.  Returning
++                # an empty visible sequence lets callers score that action
++                # instead of dropping it and entering an unbounded resampling
++                # loop.
++                return []
+             return self.output_tokens[:-pad_or_eos_len]
+         return self.output_tokens
+ 
+diff --git a/areal/engine/fsdp_engine.py b/areal/engine/fsdp_engine.py
+index 487972e..290900b 100644
+--- a/areal/engine/fsdp_engine.py
++++ b/areal/engine/fsdp_engine.py
+@@ -105,6 +105,7 @@ from areal.models.tree_attn.module import (
+     patch_fsdp_for_tree_training,
+ )
+ from areal.models.tree_attn.tree import TrieNode, build_packed_tree_batch
++from areal.models.tree_attn.validation import validate_tree_training_model_config
+ from areal.utils import (
+     logging,
+     name_resolve,
+@@ -266,6 +267,14 @@ class FSDPEngine(TrainEngine):
+         self._offload_depth: int = 0
+         self._per_layer_optim_wrapper: PerLayerOptimWrapper | None = None
+         self.enable_tree_training: bool = self.config.enable_tree_training
++        # Fail before distributed/model initialization.  Tree packing only
++        # supplies branch masks to full-attention layers; hybrid recurrent or
++        # linear-attention layers would otherwise run on the flattened trie and
++        # silently leak state across branches (for example Qwen3.6/qwen3_5).
++        validate_tree_training_model_config(
++            self.model_config,
++            enabled=self.enable_tree_training,
++        )
+ 
+     @classmethod
+     def from_pretrained(
+@@ -738,7 +747,17 @@ class FSDPEngine(TrainEngine):
+         ],
+         forward_only: bool = False,
+     ) -> None:
+-        for mb_item in mb_list:
++        n_micro_batches = len(mb_list.mbs)
++        log_progress = dist.get_rank() == 0 and n_micro_batches > 1
++        progress_every = max(1, math.ceil(n_micro_batches / 4))
++        progress_started = time.monotonic()
++        operation = "forward-only" if forward_only else "forward-backward"
++        if log_progress:
++            self.logger.info(
++                f"Starting {operation} batch with {n_micro_batches} micro-batches"
++            )
++
++        for micro_batch_idx, mb_item in enumerate(mb_list, start=1):
+             inputs, ctx = self._prepare_mb_inputs(mb_item)
+ 
+             # Lazily create tree attention metadata just before forward.
+@@ -771,6 +790,19 @@ class FSDPEngine(TrainEngine):
+                 with trace_scope("fsdp_engine.backward"):
+                     loss.backward()
+ 
++            if log_progress and (
++                micro_batch_idx % progress_every == 0
++                or micro_batch_idx == n_micro_batches
++            ):
++                elapsed = time.monotonic() - progress_started
++                mean_seconds = elapsed / micro_batch_idx
++                eta_seconds = mean_seconds * (n_micro_batches - micro_batch_idx)
++                self.logger.info(
++                    f"{operation} micro-batch progress: "
++                    f"{micro_batch_idx}/{n_micro_batches}, elapsed={elapsed:.1f}s, "
++                    f"eta={eta_seconds:.1f}s"
++                )
++
+     def train_batch(
+         self,
+         input_: list[dict[str, Any]] | dict[str, Any],
+@@ -921,9 +953,10 @@ class FSDPEngine(TrainEngine):
+ 
+     def export_stats(self) -> dict[str, float]:
+         with self._offload_aware_context():
+-            return stats_tracker.export_all(
+-                reduce_group=self.data_parallel_group,
+-            )
++            # Stats are merged by TrainController.  Keeping this export local
++            # isolates observability from the model's distributed collective
++            # sequence and prevents post-checkpoint deadlocks.
++            return stats_tracker.export_all(reduce_group=None)
+ 
+     def offload(self) -> None:
+         """Offload model memory to CPU using torch_memory_saver.
+@@ -1694,16 +1727,28 @@ class FSDPEngine(TrainEngine):
+     @trace_perf("fsdp_engine.update_weights_from_disk", category="io")
+     def _update_weights_from_disk(self, meta: WeightUpdateMeta):
+         fut = Future()
++        rank = dist.get_rank()
++        self.logger.info(
++            "Disk weight update v%s started on rank %s (LoRA=%s, path=%s)",
++            meta.version,
++            rank,
++            meta.use_lora,
++            meta.path,
++        )
+ 
+-        if dist.get_rank() == 0:
++        if rank == 0:
++            self.logger.info("Pausing rollout generation for disk weight update")
+             self.rollout_engine.pause_generation()
++            self.logger.info("Rollout generation paused; dispatching disk load")
+             fut = self.rollout_engine.update_weights_from_disk(meta)
+ 
+         assert meta.path is not None
++        self.logger.info("Rank %s exporting disk weight update", rank)
+         self._save_model_to_hf(meta.path, self.tokenizer, self.processor)
++        self.logger.info("Rank %s finished exporting disk weight update", rank)
+         # dist.barrier() are called when _save_model_to_hf finished
+ 
+-        if dist.get_rank() == 0:
++        if rank == 0:
+             update_name = names.update_weights_from_disk(
+                 self.config.experiment_name,
+                 self.config.trial_name,
+@@ -1717,11 +1762,28 @@ class FSDPEngine(TrainEngine):
+                 update_name, str(datetime.now().timestamp()), keepalive_ttl=120
+             )
+ 
++            self.logger.info("Waiting for rollout disk load to finish")
+             fut.result()
++            self.logger.info("Rollout disk load finished; resuming generation")
+             self.rollout_engine.continue_generation()
+-
+-        current_platform.synchronize()
++            self.logger.info("Rollout generation resumed")
++
++        # Saving a LoRA adapter copies every trainable tensor to CPU before
++        # safetensors serialization, so the export above has already provided
++        # the required CUDA completion point.  A second device-wide synchronize
++        # can wait forever on a stale asynchronous FSDP work item after the
++        # rank-0 HTTP callback, while all peer ranks are already at the CPU
++        # barrier.  Full-model disk updates retain the conservative synchronize.
++        if not meta.use_lora:
++            current_platform.synchronize()
++        else:
++            self.logger.info(
++                "Rank %s skipping redundant CUDA synchronize for disk LoRA update",
++                rank,
++            )
++        self.logger.info("Rank %s entering disk weight update CPU barrier", rank)
+         dist.barrier(group=self.cpu_group)
++        self.logger.info("Disk weight update v%s completed on rank %s", meta.version, rank)
+ 
+     def _save_model_to_hf(
+         self,
+@@ -1840,6 +1902,21 @@ class FSDPEngine(TrainEngine):
+         if self.model is None:
+             raise RuntimeError("Model not initialized")
+ 
++        # Long packed sequences can leave nearly the entire device held by the
++        # CUDA caching allocator even though the live model/optimizer tensors
++        # use much less memory.  DCP's planning phase performs NCCL object
++        # collectives and needs a small fresh CUDA allocation; without
++        # releasing the inactive cache that collective can fail with
++        # ``NCCL Error 1: unhandled cuda error`` on an otherwise completed
++        # training step.  All ranks execute this path, so release their caches
++        # and rendezvous before DCP constructs its sharded state dictionaries.
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++            gc.collect()
++            torch.cuda.empty_cache()
++        if dist.is_initialized():
++            dist.barrier()
++
+         os.makedirs(path, exist_ok=True)
+ 
+         dcp_state = DCPState(self.model, self.optimizer if with_optim else None)
+@@ -1976,6 +2053,18 @@ class FSDPEngine(TrainEngine):
+             padded_mb["cu_seq_lens_q"] = padded_mb["cu_seq_lens_k"] = padded_mb[
+                 "cu_seqlens"
+             ]
++            # Qwen3.5's hybrid decoder forwards arbitrary model kwargs into its
++            # Gated DeltaNet layers.  Those layers translate ``cu_seq_lens_q``
++            # back to the FLA kernel's ``cu_seqlens`` argument.  Keeping the
++            # original alias in the same kwargs dict therefore supplies
++            # ``cu_seqlens`` twice and raises before the first actor forward.
++            # The q/k aliases retain the exact packed boundaries needed by both
++            # FlashAttention and Gated DeltaNet; only remove the duplicate name
++            # from the per-forward microbatches.  ``mb_list.data`` still keeps
++            # its original ``cu_seqlens`` for loss/statistics bookkeeping.
++            if is_qwen3_5_model(self.model_config.model_type):
++                mb.pop("cu_seqlens")
++                padded_mb.pop("cu_seqlens")
+             mb["use_cache"] = False
+             padded_mb["use_cache"] = False
+             if (
+diff --git a/areal/engine/vllm_ext/areal_vllm_server.py b/areal/engine/vllm_ext/areal_vllm_server.py
+index 4cc806a..c8d2e53 100644
+--- a/areal/engine/vllm_ext/areal_vllm_server.py
++++ b/areal/engine/vllm_ext/areal_vllm_server.py
+@@ -165,7 +165,14 @@ def _register_runtime_lora_name(
+ async def areal_update_weight(request: UpdateWeightsRequest, raw_request: Request):
+     logger.info(f"API server starts areal_update_weight, {request.model_path}")
+     llm = raw_request.app.state.engine_client
+-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
++    # Disk/XCCL updates are normally wrapped by RemoteInfEngine's explicit
++    # pause/continue handshake.  In that path the run event is already clear,
++    # and resuming here would make the controller issue a second
++    # ``resume_generation`` call after the request returns.  vLLM does not
++    # make that operation idempotent and the second call can wait forever.
++    resume_after_update = _generation_run_event.is_set()
++    if resume_after_update:
++        await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+     await llm.reset_mm_cache()
+     try:
+         ret_list = await llm.collective_rpc(
+@@ -173,7 +180,8 @@ async def areal_update_weight(request: UpdateWeightsRequest, raw_request: Reques
+             args=(request.model_path,),
+         )
+     finally:
+-        await llm.resume_generation()
++        if resume_after_update:
++            await llm.resume_generation()
+     return build_response(ret_list)
+ 
+ 
+@@ -185,7 +193,9 @@ async def areal_update_weight_lora(
+         f"API server starts areal_update_weight_lora, lora_model_path-{request.lora_model_path}, lora_name-{request.lora_name}, lora_int_id-{request.lora_int_id}, base_model_name-{request.base_model_name}"
+     )
+     llm = raw_request.app.state.engine_client
+-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
++    resume_after_update = _generation_run_event.is_set()
++    if resume_after_update:
++        await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+     await llm.reset_mm_cache()
+ 
+     try:
+@@ -199,7 +209,8 @@ async def areal_update_weight_lora(
+             ),
+         )
+     finally:
+-        await llm.resume_generation()
++        if resume_after_update:
++            await llm.resume_generation()
+ 
+     return build_response(ret_list)
+ 
+@@ -208,12 +219,15 @@ async def areal_update_weight_lora(
+ async def areal_update_weight_xccl(raw_request: Request):
+     logger.info("API server starts areal_update_weight_xccl")
+     llm = raw_request.app.state.engine_client
+-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
++    resume_after_update = _generation_run_event.is_set()
++    if resume_after_update:
++        await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+     await llm.reset_mm_cache()
+     try:
+         ret_list = await llm.collective_rpc("areal_update_weight_xccl")
+     finally:
+-        await llm.resume_generation()
++        if resume_after_update:
++            await llm.resume_generation()
+     return build_response(ret_list)
+ 
+ 
+@@ -223,7 +237,9 @@ async def areal_update_weight_lora_xccl(
+ ):
+     logger.info("API server starts areal_update_weight_lora_xccl")
+     llm = raw_request.app.state.engine_client
+-    await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
++    resume_after_update = _generation_run_event.is_set()
++    if resume_after_update:
++        await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
+     await llm.reset_mm_cache()
+ 
+     try:
+@@ -236,7 +252,8 @@ async def areal_update_weight_lora_xccl(
+                 base_model_name=request.base_model_name,
+             )
+     finally:
+-        await llm.resume_generation()
++        if resume_after_update:
++            await llm.resume_generation()
+ 
+     return build_response(ret_list)
+ 
+diff --git a/areal/engine/vllm_remote.py b/areal/engine/vllm_remote.py
+index 2d76930..8f82cfc 100644
+--- a/areal/engine/vllm_remote.py
++++ b/areal/engine/vllm_remote.py
+@@ -77,6 +77,8 @@ class VLLMBackend:
+             "use_beam_search": gconfig.use_beam_search,
+             "stream": False,
+         }
++        if gconfig.seed is not None:
++            payload["seed"] = gconfig.seed
+         if gconfig.stop:
+             payload["stop"] = gconfig.stop
+ 
+diff --git a/areal/experimental/openai/client.py b/areal/experimental/openai/client.py
+index c2edfb7..3663a10 100644
+--- a/areal/experimental/openai/client.py
++++ b/areal/experimental/openai/client.py
+@@ -853,6 +853,15 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
+             )
+ 
+         top_p_val = 1.0 if is_omitted(top_p) else (top_p or 1.0)
++        top_k_val = int(extra_body.get("top_k", int(1e8)))
++        if top_k_val <= 0:
++            raise ValueError("extra_body.top_k must be a positive integer")
++        seed_val = extra_body.get("seed")
++        if seed_val is not None:
++            if not isinstance(seed_val, int) or isinstance(seed_val, bool):
++                raise TypeError("extra_body.seed must be an integer")
++            if seed_val < 0:
++                raise ValueError("extra_body.seed must be non-negative")
+         stop_tokens = None if is_omitted(stop) else stop
+ 
+         # Since the concat logic cannot properly handle stop tokens yet, so we remove stop here.
+@@ -879,6 +888,8 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
+                 engine_max_tokens=self.engine_max_tokens,
+             ),
+             top_p=top_p_val,
++            top_k=top_k_val,
++            seed=seed_val,
+             stop=stop_tokens,
+             greedy=temp == 0,
+             frequency_penalty=frequency_penalty,
+diff --git a/areal/experimental/openai/types.py b/areal/experimental/openai/types.py
+index 6153bf0..21994c0 100644
+--- a/areal/experimental/openai/types.py
++++ b/areal/experimental/openai/types.py
+@@ -40,6 +40,11 @@ class InteractionWithTokenLogpReward:
+     model_response: ModelResponse | None = None
+     reward: float | None = None
+     original_reward: float | None = None
++    # Optional long-horizon credit-assignment metadata. Workflows that leave
++    # these fields unset retain the legacy one-scalar-per-rollout behavior.
++    episode_reward: float | None = None
++    process_reward: float | None = None
++    process_reward_weight: float = 1.0
+     parent: InteractionWithTokenLogpReward | None = None
+     chat_template_type: str = "hf"
+     _cache: dict[str, torch.Tensor] | None = None
+diff --git a/areal/infra/controller/rollout_callback.py b/areal/infra/controller/rollout_callback.py
+index fc00cef..1a21374 100644
+--- a/areal/infra/controller/rollout_callback.py
++++ b/areal/infra/controller/rollout_callback.py
+@@ -48,13 +48,21 @@ class RolloutCallback:
+         """
+         url = f"http://{self.controller_addr}{endpoint}"
+         try:
+-            resp = requests.post(
++            # Callback callers only need acknowledgement; none consume the JSON
++            # response body.  With the rollout controller's long-running control
++            # endpoints, Requests can receive a successful response status and
++            # then raise ChunkedEncodingError while eagerly reading the tiny body
++            # if the controller closes the socket.  That turns an already-applied
++            # pause/resume or weight update into a fatal training error.  Stream
++            # the response so success is determined by the status line alone.
++            with requests.post(
+                 url,
+                 json=payload or {},
+                 timeout=self.request_timeout,
+-            )
+-            resp.raise_for_status()
+-            return resp.json()
++                stream=True,
++            ) as resp:
++                resp.raise_for_status()
++                return {"status": "ok"}
+         except requests.RequestException as e:
+             logger.error(f"Callback to {url} failed: {e}")
+             raise
+diff --git a/areal/infra/controller/rollout_controller.py b/areal/infra/controller/rollout_controller.py
+index 8878358..10639b2 100644
+--- a/areal/infra/controller/rollout_controller.py
++++ b/areal/infra/controller/rollout_controller.py
+@@ -1159,7 +1159,17 @@ class RolloutController:
+     async def update_weights_from_disk(self, meta: WeightUpdateMeta):
+         meta.clear_checkpoint_after_load = False
+         await self._collective_rpc_async("update_weights_from_disk", meta=meta)
+-        shutil.rmtree(meta.path, ignore_errors=True)
++        # SGLang's ``/load_lora_adapter`` endpoint only registers the adapter
++        # path.  The safetensors file is read lazily when the first generation
++        # request selects that adapter.  Removing the directory here races that
++        # lazy load and can leave the LoRA memory pool with a registered name
++        # whose adapter object is ``None``, crashing every scheduler rank.
++        #
++        # Keep versioned LoRA directories for the lifetime of the trial.  They
++        # are small compared with full-model checkpoints, while non-LoRA disk
++        # updates can still be reclaimed immediately after all workers load.
++        if not meta.use_lora:
++            shutil.rmtree(meta.path, ignore_errors=True)
+ 
+     async def pause_generation(self):
+         await self._collective_rpc_async("pause_generation")
+diff --git a/areal/infra/controller/train_controller.py b/areal/infra/controller/train_controller.py
+index 45f1c4b..0e973bf 100644
+--- a/areal/infra/controller/train_controller.py
++++ b/areal/infra/controller/train_controller.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import asyncio
++import math
+ from typing import Any
+ 
+ import torch
+@@ -32,6 +33,8 @@ from .rollout_controller import RolloutController
+ 
+ logger = logging.getLogger("TrainController")
+ 
++ENGINE_DESTROY_TIMEOUT_SECONDS = 120.0
++
+ 
+ def _find_in_structure(obj: Any, type_: type) -> Any | None:
+     """Find first instance of type_ in a nested structure."""
+@@ -42,7 +45,7 @@ def _find_in_structure(obj: Any, type_: type) -> Any | None:
+             result = _find_in_structure(v, type_)
+             if result is not None:
+                 return result
+-    if isinstance(obj, (tuple, list)):
++    if isinstance(obj, tuple | list):
+         for item in obj:
+             result = _find_in_structure(item, type_)
+             if result is not None:
+@@ -59,20 +62,127 @@ def _is_tensor_like(obj: Any) -> bool:
+ 
+ 
+ def _item_weight(d: dict[str, Any]) -> int:
+-    attn_mask = d.get("attention_mask")
+-    if isinstance(attn_mask, torch.Tensor):
+-        return int(attn_mask.sum().item())
+-    if isinstance(attn_mask, RTensor):
+-        return attn_mask.data.numel()
+-    # Fallback: first tensor's numel
+-    for v in d.values():
+-        if isinstance(v, RTensor):
+-            return v.data.numel()
+-        if isinstance(v, torch.Tensor) and v.ndim >= 2:
+-            return v.numel()
++    """Estimate an item's token cost without fetching remote tensors.
++
++    Agent trajectories may keep per-action tensors in nested lists/dicts.  The
++    old direct-key lookup assigned all such items weight 1, so an already
++    length-sorted batch was dispatched as contiguous bands (the longest band
++    to rank 0).  Walk the structure and prefer every attention mask we find.
++    Meta RTensors retain their compacted shape, which is sufficient here.
++    """
++
++    def _mask_weight(obj: Any) -> tuple[int, bool]:
++        if isinstance(obj, dict):
++            if "attention_mask" in obj:
++                return _value_weight(obj["attention_mask"], is_mask=True), True
++            total = 0
++            found = False
++            for value in obj.values():
++                weight, child_found = _mask_weight(value)
++                if child_found:
++                    total += weight
++                    found = True
++            return total, found
++        if isinstance(obj, list | tuple):
++            total = 0
++            found = False
++            for value in obj:
++                weight, child_found = _mask_weight(value)
++                if child_found:
++                    total += weight
++                    found = True
++            return total, found
++        return 0, False
++
++    def _value_weight(value: Any, *, is_mask: bool = False) -> int:
++        if isinstance(value, RTensor):
++            # Controller-side RTensors normally hold meta tensors.  Their
++            # shape was compacted before storage, so numel is the token count.
++            return int(value.data.numel())
++        if isinstance(value, torch.Tensor):
++            if is_mask and not value.is_meta:
++                return int(value.sum().item())
++            return int(value.numel())
++        if isinstance(value, dict):
++            return sum(_value_weight(v, is_mask=is_mask) for v in value.values())
++        if isinstance(value, list | tuple):
++            return sum(_value_weight(v, is_mask=is_mask) for v in value)
++        return 0
++
++    mask_weight, found_mask = _mask_weight(d)
++    if found_mask:
++        return max(mask_weight, 1)
++
++    # Fallback: use the first tensor-like payload, recursively.
++    def _first_tensor_weight(obj: Any) -> int | None:
++        if isinstance(obj, RTensor):
++            return int(obj.data.numel())
++        if isinstance(obj, torch.Tensor):
++            return int(obj.numel())
++        values = obj.values() if isinstance(obj, dict) else obj
++        if isinstance(obj, dict | list | tuple):
++            for value in values:
++                weight = _first_tensor_weight(value)
++                if weight is not None:
++                    return weight
++        return None
++
++    fallback = _first_tensor_weight(d)
++    if fallback is not None:
++        return max(fallback, 1)
+     return 1
+ 
+ 
++def _merge_local_worker_stats(worker_stats: list[dict[str, Any]]) -> dict[str, Any]:
++    """Merge statistics exported independently by DP-head workers.
++
++    This deliberately performs no torch.distributed collectives.  Statistics
++    are observability data and must not be able to wedge a completed optimizer
++    step.  Tracker scalar values carry ``__count`` companions and are merged
++    exactly; tensor averages are macro-averaged across ranks, while sums and
++    extrema retain their natural reductions.
++    """
++    if not worker_stats:
++        return {}
++
++    result: dict[str, Any] = {}
++    keys = sorted({key for stats in worker_stats for key in stats})
++    for key in keys:
++        values = [stats[key] for stats in worker_stats if key in stats]
++        numeric = [
++            float(value)
++            for value in values
++            if isinstance(value, int | float) and math.isfinite(float(value))
++        ]
++        if not numeric:
++            result[key] = values[0]
++            continue
++
++        if key.endswith("__count"):
++            result[key] = int(sum(numeric))
++        elif key.endswith("/min"):
++            result[key] = min(numeric)
++        elif key.endswith("/max"):
++            result[key] = max(numeric)
++        elif key.endswith("/avg"):
++            result[key] = sum(numeric) / len(numeric)
++        elif f"{key}__count" in keys:
++            weighted_sum = 0.0
++            total_count = 0.0
++            for stats in worker_stats:
++                if key not in stats:
++                    continue
++                count = float(stats.get(f"{key}__count", 0))
++                weighted_sum += float(stats[key]) * count
++                total_count += count
++            result[key] = weighted_sum / total_count if total_count else 0.0
++        else:
++            # Unsuffixed values without a scalar count are tracker SUMs (most
++            # commonly n_seqs/n_tokens denominators).
++            result[key] = sum(numeric)
++    return result
++
++
+ def _dispatch_tensors(
+     item_list: list[dict[str, Any]],
+     dp_size: int,
+@@ -431,10 +541,15 @@ class TrainController:
+                             worker_id=worker.id,
+                             method="destroy",
+                             engine_name=self._engine_name(rank),
++                            http_timeout=ENGINE_DESTROY_TIMEOUT_SECONDS,
++                            max_retries=1,
+                         )
+                         for rank, worker in enumerate(self.workers)
+                     ]
+-                    return await asyncio.gather(*tasks, return_exceptions=True)
++                    return await asyncio.wait_for(
++                        asyncio.gather(*tasks, return_exceptions=True),
++                        timeout=ENGINE_DESTROY_TIMEOUT_SECONDS + 5.0,
++                    )
+ 
+                 results = run_async_task(_destroy_all_engines)
+                 # Surface per-worker failures instead of silently swallowing them.
+@@ -583,6 +698,13 @@ class TrainController:
+                     self._engine_name(idx),
+                     *worker_args,
+                     rpc_meta=rpc_meta,
++                    # These calls are launched as one distributed operation;
++                    # engine methods may enter FSDP/NCCL collectives. Retrying
++                    # only the rank whose HTTP request surfaced an error can
++                    # never replay the collective and instead leaves the other
++                    # ranks blocked. Fail the aggregate call once and let the
++                    # trainer perform coordinated teardown/recovery.
++                    max_retries=1,
+                     **worker_kwargs,
+                 )
+             )
+@@ -621,10 +743,24 @@ class TrainController:
+         dict[str, Any]
+             Training statistics dictionary
+         """
+-        # Statistics have been aggregated and synchronized across workers
+-        # All results should be identical, so return the first one
+         stats = stats_tracker.export_all()
+-        stats.update(self._custom_function_call("export_stats"))
++        # Export locally on every worker and merge on the controller.  A stats
++        # collective must never block a completed training/checkpoint step;
++        # this also avoids interacting with stale NCCL work after disk-LoRA
++        # synchronization.  Only DP-head results represent dispatched data.
++        results = run_async_task(
++            self._call_workers,
++            "export_stats",
++            [],
++            {},
++            rpc_meta={"broadcast": False},
++        )
++        dp_head_stats = [
++            value
++            for value, is_dp_head in zip(results, self.workers_is_dp_head, strict=True)
++            if is_dp_head and isinstance(value, dict)
++        ]
++        stats.update(_merge_local_worker_stats(dp_head_stats))
+         return stats
+ 
+     # ==================== ENGINE RPC WRAPPERS ====================
+@@ -668,7 +804,15 @@ class TrainController:
+         version : int
+             The weight version number to set
+         """
+-        self._custom_function_call("set_version", version)
++        # Pure data-parallel layouts dispatch the same scalar to every worker,
++        # so broadcasting it again on the device group is redundant.  More
++        # importantly, a device broadcast immediately after an FSDP disk-LoRA
++        # update can wait on stale asynchronous CUDA work even though all ranks
++        # have already completed the update's CPU barrier.  Model/context
++        # parallel layouts still need the normal head-to-peer broadcast because
++        # non-head workers receive empty RPC arguments from _call_workers.
++        rpc_meta = {"broadcast": False} if all(self.workers_is_dp_head) else None
++        self._custom_function_call("set_version", version, rpc_meta=rpc_meta)
+ 
+     def get_version(self) -> int:
+         """Get the current weight version in the training engine.
+diff --git a/areal/infra/remote_inf_engine.py b/areal/infra/remote_inf_engine.py
+index e6d5ae8..ab0e965 100644
+--- a/areal/infra/remote_inf_engine.py
++++ b/areal/infra/remote_inf_engine.py
+@@ -67,6 +67,76 @@ RID_CACHE_SIZE = 128
+ logger = logging.getLogger("RemoteInfEngine")
+ 
+ 
++def _stage_disk_weights_from_ssh(meta: WeightUpdateMeta) -> None:
++    """Mirror a completed disk update when rollout runs on another machine.
++
++    AReaL's disk LoRA updater normally assumes a shared filesystem.  For a Ray
++    cluster without NFS, ``AREAL_DISK_WEIGHT_SOURCE`` can name the SSH source
++    (for example ``root@10.0.0.1``).  The actor's name-resolve notification is
++    emitted only after the adapter has been completely written, so pulling here
++    preserves the same save-before-load ordering as a shared mount.
++    """
++    assert meta.path is not None
++    if meta.use_lora:
++        required = (
++            os.path.join(meta.path, "adapter_config.json"),
++            os.path.join(meta.path, "adapter_model.safetensors"),
++        )
++        if all(os.path.isfile(path) for path in required):
++            return
++    elif os.path.isdir(meta.path) and os.listdir(meta.path):
++        return
++
++    source = os.environ.get("AREAL_DISK_WEIGHT_SOURCE", "").strip().rstrip(":")
++    if not source:
++        return
++    port = os.environ.get("AREAL_DISK_WEIGHT_SSH_PORT", "22").strip()
++    timeout = float(os.environ.get("AREAL_DISK_WEIGHT_SYNC_TIMEOUT", "300"))
++    os.makedirs(meta.path, exist_ok=True)
++    ssh_command = (
++        f"ssh -p {int(port)} -o BatchMode=yes "
++        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
++    )
++    logger.info("Staging disk weights from %s:%s", source, meta.path)
++    subprocess.run(
++        [
++            "rsync",
++            "-a",
++            "--partial",
++            "-e",
++            ssh_command,
++            f"{source}:{meta.path.rstrip('/')}/",
++            f"{meta.path.rstrip('/')}/",
++        ],
++        check=True,
++        timeout=timeout,
++    )
++    if meta.use_lora and not all(os.path.isfile(path) for path in required):
++        raise FileNotFoundError(
++            f"staged LoRA adapter is incomplete at {meta.path}: {required}"
++        )
++
++
++def _stage_initial_lora_modules_from_ssh(server_args: dict[str, Any]) -> None:
++    """Stage vLLM's startup adapters before the server tries to load them.
++
++    Disk weight updates are staged after the actor publishes a new version, but
++    the initial adapter is passed directly in ``--lora-modules`` during server
++    startup.  On a cluster without shared storage that path must be mirrored
++    before vLLM starts, otherwise its first ``add_lora`` call fails.
++    """
++    modules = server_args.get("lora_modules") or []
++    for module in modules:
++        if not isinstance(module, str) or "=" not in module:
++            continue
++        _name, path = module.split("=", 1)
++        if not path:
++            continue
++        _stage_disk_weights_from_ssh(
++            WeightUpdateMeta(type="disk", path=path, use_lora=True)
++        )
++
++
+ class GroupedRolloutWorkflow(RolloutWorkflow):
+     def __init__(
+         self,
+@@ -89,8 +159,19 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
+     ) -> dict[str, Any] | None:
+         from areal.experimental.openai import InteractionWithTokenLogpReward
+ 
++        async def run_sample(sample_idx: int):
++            parent_context = workflow_context.get()
++            workflow_context.set(
++                workflow_context.WorkflowContext(
++                    is_eval=parent_context.is_eval,
++                    task_id=parent_context.task_id,
++                    sample_idx=sample_idx,
++                )
++            )
++            return await self.workflow.arun_episode(engine, data)
++
+         results = await asyncio.gather(
+-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
++            *[run_sample(sample_idx) for sample_idx in range(self.group_size)]
+         )
+ 
+         valid_results = [r for r in results if r is not None]
+@@ -152,13 +233,30 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
+         """
+         import torch
+ 
++        credit_assigned = []
++        for result in results:
++            if not result:
++                credit_assigned.append(False)
++                continue
++            last_id = next(reversed(result))
++            credit_assigned.append(result[last_id].episode_reward is not None)
++        if any(credit_assigned) and not all(credit_assigned):
++            self.logger.warning(
++                "reward_normalization: dropping group with mixed episode-reward metadata"
++            )
++            return False
++
++        use_step_credit = bool(credit_assigned) and all(credit_assigned)
+         reward_per_result: list[float | None] = []
+         for result in results:
+             if not result:
+                 reward_per_result.append(None)
+                 continue
+             last_id = next(reversed(result))
+-            reward_per_result.append(result[last_id].reward)
++            last = result[last_id]
++            reward_per_result.append(
++                last.episode_reward if use_step_credit else last.reward
++            )
+ 
+         none_count = sum(1 for reward in reward_per_result if reward is None)
+         if none_count > 0:
+@@ -178,11 +276,19 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
+                 continue
+             for interaction in result.values():
+                 if interaction.reward is not None:
+-                    interaction.original_reward = interaction.reward
+-                    interaction.reward = norm_reward
++                    if use_step_credit:
++                        process_reward = interaction.process_reward or 0.0
++                        interaction.original_reward = interaction.episode_reward
++                        interaction.reward = (
++                            norm_reward
++                            + interaction.process_reward_weight * process_reward
++                        )
++                    else:
++                        interaction.original_reward = interaction.reward
++                        interaction.reward = norm_reward
+                     if interaction._cache is not None:
+                         interaction._cache["rewards"] = torch.tensor(
+-                            [float(norm_reward)]
++                            [float(interaction.reward)]
+                         )
+                         interaction._cache["original_rewards"] = torch.tensor(
+                             [float(interaction.original_reward)]
+@@ -1476,6 +1582,7 @@ class RemoteInfEngine(InferenceEngine):
+ 
+     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
+         """Launch a local inference server."""
++        _stage_initial_lora_modules_from_ssh(server_args)
+         server_args["host"] = gethostip()
+         server_args["port"] = find_free_ports(1)[0]
+         process = self.backend.launch_server(server_args)
+@@ -1529,6 +1636,7 @@ def _update_weights_from_disk(
+             experiment_name, trial_name, model_version
+         )
+         save_timestamp = float(name_resolve.wait(update_name, timeout=120))
++        _stage_disk_weights_from_ssh(meta)
+         load_timestamp = datetime.now().timestamp()
+ 
+         # Get requests from backend with version for LoRA name
+diff --git a/areal/infra/rpc/guard/engine_blueprint.py b/areal/infra/rpc/guard/engine_blueprint.py
+index e481e97..d08ea1e 100644
+--- a/areal/infra/rpc/guard/engine_blueprint.py
++++ b/areal/infra/rpc/guard/engine_blueprint.py
+@@ -26,6 +26,7 @@ from queue import Queue
+ from threading import Lock, Thread
+ from typing import Annotated, Any
+ 
++import torch.distributed as dist
+ from flask import Blueprint, jsonify, request
+ from pydantic import BaseModel, StringConstraints, ValidationError
+ 
+@@ -103,6 +104,18 @@ def resolve_broadcast_target(
+     return engine.context_and_model_parallel_group, device
+ 
+ 
++def _broadcast_group_has_peers(group: Any) -> bool:
++    """Return whether an RPC payload collective is needed for ``group``.
++
++    ``None`` denotes the default process group and must retain the existing
++    broadcast behavior.  An explicit one-rank model/context group has no peers:
++    pure-DP dispatch already supplies that worker with its own RPC arguments,
++    so issuing a CUDA collective is both redundant and can inherit stale async
++    work from the preceding model update.
++    """
++    return group is None or dist.get_world_size(group) > 1
++
++
+ engine_bp = Blueprint("engine", __name__)
+ 
+ # ---------------------------------------------------------------------------
+@@ -484,23 +497,31 @@ def call_engine_method():
+                     engine=engine, rpc_meta=rpc_meta
+                 )
+                 if should_broadcast:
+-                    logger.debug(f"Broadcasting RPC payload for method: {method_name}")
+                     bcast_group, bcast_device = resolve_broadcast_target(
+                         engine, current_platform.current_device()
+                     )
+-                    args_bcast = tensor_container_to(args, bcast_device)
+-                    args_bcast = broadcast_tensor_container(
+-                        args_bcast,
+-                        src_rank=engine.current_data_parallel_head(),
+-                        group=bcast_group,
+-                    )
+-                    kwargs_bcast = tensor_container_to(kwargs, bcast_device)
+-                    kwargs_bcast = broadcast_tensor_container(
+-                        kwargs_bcast,
+-                        src_rank=engine.current_data_parallel_head(),
+-                        group=bcast_group,
+-                    )
+-                    logger.debug("Broadcasting RPC payload done.")
++                    if _broadcast_group_has_peers(bcast_group):
++                        logger.debug(
++                            f"Broadcasting RPC payload for method: {method_name}"
++                        )
++                        args_bcast = tensor_container_to(args, bcast_device)
++                        args_bcast = broadcast_tensor_container(
++                            args_bcast,
++                            src_rank=engine.current_data_parallel_head(),
++                            group=bcast_group,
++                        )
++                        kwargs_bcast = tensor_container_to(kwargs, bcast_device)
++                        kwargs_bcast = broadcast_tensor_container(
++                            kwargs_bcast,
++                            src_rank=engine.current_data_parallel_head(),
++                            group=bcast_group,
++                        )
++                        logger.debug("Broadcasting RPC payload done.")
++                    else:
++                        logger.debug(
++                            "Skipping RPC payload broadcast for singleton group "
++                            f"on method: {method_name}"
++                        )
+ 
+                 logger.debug(f"Calling engine '{engine_name}' method: {method_name}")
+ 
+diff --git a/areal/infra/utils/proc.py b/areal/infra/utils/proc.py
+index 22576e3..02aad5e 100644
+--- a/areal/infra/utils/proc.py
++++ b/areal/infra/utils/proc.py
+@@ -123,6 +123,15 @@ def run_with_streaming_logs(
+     subprocess.Popen
+         The spawned process
+     """
++    # This helper can run inside a Ray actor on a different node from the
++    # scheduler.  The scheduler may have created its local log directory, but
++    # that path is not necessarily backed by shared storage.  Create the
++    # parents on the node that will actually open the files before wiring the
++    # process output through ``tee``.  Otherwise tee exits immediately and the
++    # long-lived worker later fails with EPIPE when it writes its first log.
++    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
++    Path(merged_log).parent.mkdir(parents=True, exist_ok=True)
++
+     shell_cmd = build_streaming_log_cmd(
+         cmd, str(log_file), str(merged_log), role, env_vars=env_vars_in_cmd
+     )
+diff --git a/areal/infra/workflow_context.py b/areal/infra/workflow_context.py
+index beb9513..4a18b55 100644
+--- a/areal/infra/workflow_context.py
++++ b/areal/infra/workflow_context.py
+@@ -31,10 +31,13 @@ class WorkflowContext:
+         Whether the workflow is running in evaluation mode.
+     task_id : int | None
+         The task ID assigned by the workflow executor.
++    sample_idx : int
++        Group-local rollout sample index. Zero for ungrouped workflows.
+     """
+ 
+     is_eval: bool = False
+     task_id: int | None = None
++    sample_idx: int = 0
+ 
+ 
+ _current_context: ContextVar[WorkflowContext] = ContextVar(
+diff --git a/areal/infra/workflow_executor.py b/areal/infra/workflow_executor.py
+index b2870bf..24afe28 100644
+--- a/areal/infra/workflow_executor.py
++++ b/areal/infra/workflow_executor.py
+@@ -670,6 +670,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
+         """
+         accepted_cnt = 0
+         total_attempts = 0
++        consecutive_rejections = 0
+         results = []
+ 
+         while True:
+@@ -707,17 +708,25 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
+ 
+             for res in arrived:
+                 is_accepted = res is not None
++                total_attempts += 1
+ 
+                 if not is_accepted:
++                    consecutive_rejections += 1
++                    if not dynamic_bs and consecutive_rejections >= batch_size:
++                        raise RuntimeError(
++                            "Rollout batch made no progress: received "
++                            f"{consecutive_rejections} consecutive rejected/failed "
++                            "tasks. This usually indicates a systemic workflow or "
++                            "remote-code failure; refusing to refill forever."
++                        )
+                     if dynamic_bs:
+-                        total_attempts += 1
+                         if total_attempts >= batch_size:
+                             break
+                     continue
+ 
+                 # Accepted sample
+                 accepted_cnt += 1
+-                total_attempts += 1
++                consecutive_rejections = 0
+                 results.append(res)
+ 
+                 if dynamic_bs:
+diff --git a/areal/trainer/ppo/actor.py b/areal/trainer/ppo/actor.py
+index 75dbbd7..af3e9fa 100644
+--- a/areal/trainer/ppo/actor.py
++++ b/areal/trainer/ppo/actor.py
+@@ -30,6 +30,7 @@ from areal.utils.data import (
+ )
+ from areal.utils.functional import (
+     cispo_loss_fn,
++    count_masked_sequences,
+     ppo_actor_loss_fn,
+     reward_overlong_penalty,
+     sapo_loss_fn,
+@@ -42,6 +43,22 @@ from areal.v2.training_service.controller.controller import (
+ logger = logging.getLogger("PPOActor")
+ 
+ 
++def _get_cu_seqlens(data: dict[str, Any]) -> torch.Tensor | None:
++    cu_seqlens = data.get("cu_seqlens")
++    if cu_seqlens is None:
++        cu_seqlens = data.get("cu_seq_lens_q")
++    return cu_seqlens
++
++
++def _policy_loss_weight(data: dict[str, Any], reduction: str) -> torch.Tensor:
++    loss_mask = data["loss_mask"].bool()
++    if reduction == "token_mean":
++        return loss_mask.count_nonzero()
++    if reduction == "sequence_mean":
++        return count_masked_sequences(loss_mask, _get_cu_seqlens(data))
++    raise ValueError(f"unknown loss reduction: {reduction!r}")
++
++
+ def _infer_prompt_lens(
+     attention_mask: torch.Tensor, loss_mask: torch.Tensor
+ ) -> torch.Tensor:
+@@ -134,6 +151,7 @@ class PPOActor:
+         logger.info(
+             f"  importance_sampling_level: {getattr(config, 'importance_sampling_level', 'token')}"
+         )
++        logger.info(f"  loss_reduction: {config.loss_reduction}")
+         logger.info(
+             f"  adv_norm: {config.adv_norm if config.adv_norm else 'DISABLED (None)'}"
+         )
+@@ -391,8 +409,12 @@ class PPOActor:
+                         sapo_tau_neg=self.config.sapo_tau_neg,
+                         use_cispo_loss=self.config.use_cispo_loss,
+                         use_decoupled_loss=self.config.use_decoupled_loss,
++                        loss_reduction=self.config.loss_reduction,
++                    ),
++                    loss_weight_fn=functools.partial(
++                        _policy_loss_weight,
++                        reduction=self.config.loss_reduction,
+                     ),
+-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                 )
+                 stats_tracker.scalar(**train_stat)
+ 
+@@ -454,6 +476,7 @@ def grpo_loss_fn(
+     sapo_tau_neg: float = 1.05,
+     use_cispo_loss: bool = False,
+     use_decoupled_loss: bool = False,
++    loss_reduction: str = "token_mean",
+     vocab_min_logits: torch.Tensor | None = None,
+     vocab_max_logits: torch.Tensor | None = None,
+     vocab_mean_logits: torch.Tensor | None = None,
+@@ -506,7 +529,7 @@ def grpo_loss_fn(
+             loss_mask=loss_mask,
+             old_logprobs=old_logp,
+             rejection_sampling=rejection_sampling,
+-            cu_seqlens=input_data.get("cu_seqlens"),
++            cu_seqlens=_get_cu_seqlens(input_data),
+         )
+     elif use_sapo_loss:
+         if use_decoupled_loss:
+@@ -522,7 +545,7 @@ def grpo_loss_fn(
+             tau_neg=sapo_tau_neg,
+             loss_mask=loss_mask,
+             importance_sampling_level=importance_sampling_level,
+-            cu_seqlens=input_data.get("cu_seqlens"),
++            cu_seqlens=_get_cu_seqlens(input_data),
+         )
+     else:
+         loss, stat = ppo_actor_loss_fn(
+@@ -536,7 +559,8 @@ def grpo_loss_fn(
+             proximal_logprobs=prox_logp,
+             rejection_sampling=rejection_sampling,
+             importance_sampling_level=importance_sampling_level,
+-            cu_seqlens=input_data.get("cu_seqlens"),
++            cu_seqlens=_get_cu_seqlens(input_data),
++            loss_reduction=loss_reduction,
+         )
+ 
+     # Joint Distillation KL Loss
+@@ -607,6 +631,15 @@ def grpo_loss_fn(
+             behave_approx_kl=stat["behave_approx_kl"],
+             denominator="unclipped_behave_tokens",
+         )
++        stats_tracker.stat(
++            behave_imp_weight_applied=stat["behave_imp_weight_applied"],
++            behave_imp_weight_sq=stat["behave_imp_weight_sq"],
++            behave_ratio_below_0_5=stat["behave_ratio_below_0_5"],
++            behave_ratio_above_2=stat["behave_ratio_above_2"],
++            behave_ratio_above_5=stat["behave_ratio_above_5"],
++            behave_k3=stat["behave_k3"],
++            denominator="n_valid_tokens",
++        )
+         behave_filtered_mask = loss_mask & ~stat["behave_mask"]
+         stats_tracker.stat(
+             behave_filtered_ratio=behave_filtered_mask.float(),
+diff --git a/areal/trainer/rl_trainer.py b/areal/trainer/rl_trainer.py
+index 117ff61..c50e4fc 100644
+--- a/areal/trainer/rl_trainer.py
++++ b/areal/trainer/rl_trainer.py
+@@ -358,7 +358,10 @@ class PPOTrainer:
+         )
+ 
+         self.eval_rollout = None
+-        if not self._online_mode:
++        # An evaluation rollout has no consumer when no validation dataset was
++        # supplied.  Besides wasting a colocated worker, forking that worker can
++        # fail independently and abort an otherwise valid training-only run.
++        if not self._online_mode and valid_dataset is not None:
+             self.eval_rollout = self._init_rollout(
+                 config.rollout, is_eval=True, lora_path=initial_lora_path
+             )
+@@ -995,24 +998,22 @@ class PPOTrainer:
+             )
+ 
+     def close(self):
+-        self.saver.finalize()
++        saver = getattr(self, "saver", None)
++        if saver is not None:
++            saver.finalize()
+         if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
+             self._train_rdataset.close()
+         if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
+             self._valid_rdataset.close()
+         if hasattr(self, "data_controller") and self.data_controller is not None:
+             self.data_controller.destroy()
+-        self.stats_logger.close()
+-        if self.eval_rollout is not None:
+-            self.eval_rollout.destroy()
+-        self.rollout.destroy()
+-        if self.teacher is not None:
+-            self.teacher.destroy()
+-        if self.ref is not None:
+-            self.ref.destroy()
+-        if self.critic is not None:
+-            self.critic.destroy()
+-        self.actor.destroy()
++        stats_logger = getattr(self, "stats_logger", None)
++        if stats_logger is not None:
++            stats_logger.close()
++        for attr in ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor"):
++            controller = getattr(self, attr, None)
++            if controller is not None:
++                controller.destroy()
+         perf_tracer.save(force=True)
+ 
+     def _config_perf_tracer(self):
+@@ -1342,14 +1343,26 @@ class PPOTrainer:
+ 
+     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
+         # Save as HF models for evaluation
+-        self.saver.save(
+-            self.actor,
+-            epoch,
+-            epoch_step,
+-            global_step,
+-            tokenizer=self.tokenizer,
+-            processor=self.processor,
+-        )
++        reused_disk_lora = False
++        if self.weight_update_meta.type == "disk" and self.weight_update_meta.use_lora:
++            versioned_meta = self.weight_update_meta.with_version(global_step + 1)
++            if versioned_meta.path is not None and os.path.isdir(versioned_meta.path):
++                reused_disk_lora = True
++                self.saver.save_existing_hf(
++                    versioned_meta.path,
++                    epoch,
++                    epoch_step,
++                    global_step,
++                )
++        if not reused_disk_lora:
++            self.saver.save(
++                self.actor,
++                epoch,
++                epoch_step,
++                global_step,
++                tokenizer=self.tokenizer,
++                processor=self.processor,
++            )
+         if self.critic is not None:
+             self.saver.save(
+                 self.critic,
+diff --git a/areal/utils/data.py b/areal/utils/data.py
+index 1560742..f082f70 100644
+--- a/areal/utils/data.py
++++ b/areal/utils/data.py
+@@ -484,13 +484,61 @@ def allocate_balanced_mbs_synced(
+     group_indices = allocate_balanced_mbs(mb_spec, lens)
+     if not dist.is_initialized():
+         return group_indices
+-    all_n_mbs = [None for _ in range(dist.get_world_size(group))]
+-    dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
+-    if all(mbs == len(group_indices) for mbs in all_n_mbs):
+-        return group_indices
+-    return allocate_balanced_mbs_synced(
+-        MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)), lens, group=group
++    all_stats = [None for _ in range(dist.get_world_size(group))]
++    dist.all_gather_object(
++        all_stats, (len(group_indices), len(lens)), group=group
+     )
++    all_n_mbs = [stats[0] for stats in all_stats]
++    all_n_values = [stats[1] for stats in all_stats]
++    target_n_mbs = max(all_n_mbs)
++    if target_n_mbs > min(all_n_values):
++        raise RuntimeError(
++            "Unable to synchronize non-empty micro-batches across distributed "
++            f"ranks: natural micro-batch counts={all_n_mbs}, sequence-group "
++            f"counts={all_n_values}, required common count={target_n_mbs}. "
++            "Increase max_tokens_per_mb, reduce data-parallel size, or rebalance "
++            "the sequences dispatched to data-parallel ranks."
++        )
++    if all(mbs == target_n_mbs for mbs in all_n_mbs):
++        return group_indices
++    # ``n_mbs`` is a *minimum* for the packing algorithms, not an exact
++    # target. Re-running FFD with ``min_groups=target_n_mbs`` can therefore
++    # create one more bin than requested even when this rank's natural packing
++    # used fewer bins. Splitting already-valid natural bins is sufficient and
++    # cannot violate the token capacity: every child is a subset of a valid
++    # parent. It also guarantees the exact distributed forward count as long
++    # as the feasibility check above established enough non-empty values.
++    group_indices = [list(indices) for indices in group_indices]
++    while len(group_indices) < target_n_mbs:
++        candidates = [
++            (sum(lens[index] for index in indices), len(indices), position)
++            for position, indices in enumerate(group_indices)
++            if len(indices) > 1
++        ]
++        if not candidates:
++            raise RuntimeError(
++                "Unable to split natural micro-batches to the synchronized "
++                f"count {target_n_mbs}; current count={len(group_indices)}, "
++                f"sequence-group count={len(lens)}."
++            )
++        _, _, position = max(candidates)
++        source = sorted(group_indices.pop(position), key=lambda index: -lens[index])
++        children: list[list[int]] = [[], []]
++        totals = [0, 0]
++        for index in source:
++            child = 0 if totals[0] <= totals[1] else 1
++            children[child].append(index)
++            totals[child] += lens[index]
++        if not all(children):
++            raise RuntimeError("micro-batch split unexpectedly produced an empty child")
++        group_indices.extend(children)
++    group_indices = sorted(sorted(indices) for indices in group_indices)
++    if len(group_indices) != target_n_mbs:
++        raise RuntimeError(
++            "Synchronized micro-batch allocation produced an unexpected count: "
++            f"expected {target_n_mbs}, got {len(group_indices)}."
++        )
++    return group_indices
+ 
+ 
+ def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
+diff --git a/areal/utils/functional/__init__.py b/areal/utils/functional/__init__.py
+index b09c6af..c1476cd 100644
+--- a/areal/utils/functional/__init__.py
++++ b/areal/utils/functional/__init__.py
+@@ -4,6 +4,7 @@ from areal.utils.functional.functional import (
+     RejectionSamplingResult,
+     apply_rejection_sampling,
+     cispo_loss_fn,
++    count_masked_sequences,
+     dpo_pair_logratios,
+     dpo_preference_loss,
+     masked_normalization,
+@@ -22,6 +23,7 @@ __all__ = [
+     "RejectionSamplingResult",
+     "apply_rejection_sampling",
+     "cispo_loss_fn",
++    "count_masked_sequences",
+     "dpo_pair_logratios",
+     "dpo_preference_loss",
+     "masked_normalization",
+diff --git a/areal/utils/functional/functional.py b/areal/utils/functional/functional.py
+index 6d82f17..499e968 100644
+--- a/areal/utils/functional/functional.py
++++ b/areal/utils/functional/functional.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import functools
++import math
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -149,6 +150,72 @@ def _compute_sequence_level_ratio_and_advantages(
+     return ratio, advantages
+ 
+ 
++def count_masked_sequences(
++    loss_mask: torch.Tensor,
++    cu_seqlens: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Count sequences containing at least one active loss token."""
++
++    if loss_mask.ndim == 1:
++        if cu_seqlens is None:
++            raise ValueError("cu_seqlens is required for packed sequence reduction")
++        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=loss_mask.device)
++        sequence_idx = torch.arange(
++            lengths.numel(), device=loss_mask.device
++        ).repeat_interleave(lengths)
++        counts = torch.zeros(
++            lengths.numel(), device=loss_mask.device, dtype=torch.int64
++        ).scatter_add_(0, sequence_idx, loss_mask.to(torch.int64))
++        return counts.gt(0).sum()
++    if loss_mask.ndim == 2:
++        return loss_mask.any(dim=-1).sum()
++    raise ValueError(f"loss_mask must be 1D or 2D, got shape {loss_mask.shape}")
++
++
++def reduce_masked_loss(
++    values: torch.Tensor,
++    active_mask: torch.Tensor,
++    normalization_mask: torch.Tensor,
++    *,
++    reduction: str,
++    cu_seqlens: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Reduce token losses with either token- or sequence-equal weighting.
++
++    ``active_mask`` may be narrowed by rejection sampling. The denominator uses
++    ``normalization_mask`` so filtering tokens does not inflate the survivors.
++    """
++
++    masked_values = torch.where(active_mask, values, 0.0)
++    if reduction == "token_mean":
++        return masked_values.sum() / normalization_mask.count_nonzero().clamp(min=1)
++    if reduction != "sequence_mean":
++        raise ValueError(f"unknown loss reduction: {reduction!r}")
++
++    if values.ndim == 1:
++        if cu_seqlens is None:
++            raise ValueError("cu_seqlens is required for packed sequence reduction")
++        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=values.device)
++        sequence_idx = torch.arange(
++            lengths.numel(), device=values.device
++        ).repeat_interleave(lengths)
++        sums = torch.zeros(
++            lengths.numel(), device=values.device, dtype=values.dtype
++        ).scatter_add_(0, sequence_idx, masked_values)
++        counts = torch.zeros(
++            lengths.numel(), device=values.device, dtype=torch.int64
++        ).scatter_add_(0, sequence_idx, normalization_mask.to(torch.int64))
++    elif values.ndim == 2:
++        sums = masked_values.sum(dim=-1)
++        counts = normalization_mask.sum(dim=-1)
++    else:
++        raise ValueError(f"loss values must be 1D or 2D, got shape {values.shape}")
++
++    valid = counts.gt(0)
++    per_sequence = sums / counts.clamp(min=1).to(values.dtype)
++    return per_sequence.masked_select(valid).mean()
++
++
+ @dataclass
+ class RejectionSamplingResult:
+     """Result of rejection sampling, used by ppo_actor_loss_fn.
+@@ -461,6 +528,7 @@ def ppo_actor_loss_fn(
+     rejection_sampling: RejectionSamplingConfig | None = None,
+     importance_sampling_level: str = "token",
+     cu_seqlens: torch.Tensor | None = None,
++    loss_reduction: str = "token_mean",
+ ) -> tuple[torch.Tensor, dict]:
+     """PPO actor loss function with optional rejection sampling.
+ 
+@@ -503,7 +571,6 @@ def ppo_actor_loss_fn(
+     # This keeps the denominator consistent with loss_weight_fn in actor.py,
+     # which always uses the original loss_mask from input_data. Without this,
+     # mask mode would inflate per-token gradients by N_original / N_kept.
+-    loss_mask_count = loss_mask.count_nonzero() or 1
+     # Pre-filter mask kept for ratio/clip statistics: rejection sampling below
+     # narrows loss_mask for the loss, but stats stay on the original mask so
+     # importance_weight/avg reads 1.0 under proximal reuse instead of
+@@ -568,7 +635,13 @@ def ppo_actor_loss_fn(
+         pg_loss = pg_loss * behave_imp_weight
+ 
+     logging_loss = pg_loss.detach()
+-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
++    pg_loss = reduce_masked_loss(
++        pg_loss,
++        loss_mask,
++        stat_loss_mask,
++        reduction=loss_reduction,
++        cu_seqlens=cu_seqlens,
++    )
+     clip_mask.logical_and_(stat_loss_mask)
+     dual_clip_mask.logical_and_(stat_loss_mask)
+     # One host sync per microbatch: the count feeds three derived stats.
+@@ -587,9 +660,39 @@ def ppo_actor_loss_fn(
+     )
+ 
+     if rejection_sampling is not None:
++        # Keep diagnostics on the pre-filter distribution. The correction
++        # tensor is zeroed for rejected tokens, so its min/avg alone cannot
++        # distinguish a healthy narrow ratio distribution from a long low
++        # tail. Threshold indicators stay in log space; only the diagnostic
++        # K3 exponent is clamped for numerical safety. None of these tensors
++        # participates in the loss.
++        behave_log_ratio = (
++            proximal_logprobs.detach().float() - old_logprobs.detach().float()
++        )
++        behave_log_ratio = torch.where(
++            torch.isfinite(behave_log_ratio),
++            behave_log_ratio,
++            torch.zeros_like(behave_log_ratio),
++        )
++        behave_ratio_for_stats = torch.exp(behave_log_ratio.clamp(-20.0, 20.0))
++        valid_float = stat_loss_mask.float()
+         stat.update(
+             behave_approx_kl=behave_approx_kl.detach(),
+             behave_imp_weight=behave_imp_weight.detach(),
++            behave_imp_weight_applied=behave_imp_weight.detach() * valid_float,
++            behave_imp_weight_sq=behave_imp_weight.detach().square() * valid_float,
++            behave_ratio_below_0_5=(
++                (behave_log_ratio < math.log(0.5)).float() * valid_float
++            ),
++            behave_ratio_above_2=(
++                (behave_log_ratio > math.log(2.0)).float() * valid_float
++            ),
++            behave_ratio_above_5=(
++                (behave_log_ratio > math.log(5.0)).float() * valid_float
++            ),
++            behave_k3=(
++                (behave_ratio_for_stats - behave_log_ratio - 1.0) * valid_float
++            ),
+             behave_mask=behave_mask,
+             filtered_fraction=filtered_fraction,
+         )
+diff --git a/areal/utils/name_resolve.py b/areal/utils/name_resolve.py
+index 413efd6..4e819fb 100644
+--- a/areal/utils/name_resolve.py
++++ b/areal/utils/name_resolve.py
+@@ -541,7 +541,10 @@ class Etcd3NameRecordRepository(NameRecordRepository):
+                 lease_id=lease_id,
+                 keepalive_ttl=keepalive_ttl,
+                 keeper=(
+-                    timeutil.FrequencyControl(frequency_seconds=keepalive_ttl / 3)
++                    timeutil.FrequencyControl(
++                        frequency_seconds=keepalive_ttl / 3,
++                        synchronize=False,
++                    )
+                     if keepalive_ttl
+                     else None
+                 ),
+@@ -993,7 +996,10 @@ class RayNameResolveRepository:
+                 lease_id=lease_id,
+                 keepalive_ttl=keepalive_ttl,
+                 keeper=(
+-                    timeutil.FrequencyControl(frequency_seconds=keepalive_ttl / 3)
++                    timeutil.FrequencyControl(
++                        frequency_seconds=keepalive_ttl / 3,
++                        synchronize=False,
++                    )
+                     if keepalive_ttl
+                     else None
+                 ),
+diff --git a/areal/utils/recover.py b/areal/utils/recover.py
+index 2ff898e..9691339 100644
+--- a/areal/utils/recover.py
++++ b/areal/utils/recover.py
+@@ -165,6 +165,22 @@ class RecoverHandler:
+             freq_sec=config.freq_secs,
+         )
+ 
++    def _load_frequency_state(self, checkpoint_info: dict) -> None:
++        """Restore cadence counters without overriding the current config.
++
++        FrequencyControl state includes both counters and the frequency values.
++        A resumed run may intentionally tighten or relax its checkpoint cadence,
++        so values from the old checkpoint must not replace the new CLI/config
++        settings.
++        """
++        self.freq_ctl.load_state_dict(checkpoint_info)
++        self.freq_ctl.freq_epoch = self.config.freq_epochs
++        self.freq_ctl.freq_step = self.config.freq_steps
++        self.freq_ctl.freq_sec = self.config.freq_secs
++        self.freq_ctl.epoch_ctl.frequency_steps = self.config.freq_epochs
++        self.freq_ctl.step_ctl.frequency_steps = self.config.freq_steps
++        self.freq_ctl.time_ctl.frequency_seconds = self.config.freq_secs
++
+     @staticmethod
+     def recover_info_path(
+         experiment_name: str,
+@@ -351,7 +367,7 @@ class RecoverHandler:
+             recover_info: RecoverInfo = RecoverInfo.load(recover_info_path)
+             logger.info(f"Recovering from {recover_info.last_step_info.next()}.")
+             saver.load_state_dict(recover_info.saver_info)
+-            self.freq_ctl.load_state_dict(recover_info.checkpoint_info)
++            self._load_frequency_state(recover_info.checkpoint_info)
+             evaluator.load_state_dict(recover_info.evaluator_info)
+             stats_logger.load_state_dict(recover_info.stats_logger_info)
+             dataloader.load_state_dict(recover_info.dataloader_info)
+diff --git a/areal/utils/saver.py b/areal/utils/saver.py
+index 989ffd7..6e04247 100644
+--- a/areal/utils/saver.py
++++ b/areal/utils/saver.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import getpass
+ import os
++import shutil
+ from typing import TYPE_CHECKING
+ 
+ from transformers import PreTrainedTokenizerFast
+@@ -157,6 +158,44 @@ class Saver:
+             )
+             engine.save(meta)
+ 
++    def save_existing_hf(
++        self,
++        source_path: str,
++        epoch: int,
++        step: int,
++        global_step: int,
++        name: str = "default",
++    ) -> bool:
++        """Publish an already exported HF checkpoint at the scheduled path.
++
++        Disk-mode LoRA weight updates export exactly the adapter that the HF
++        saver would immediately export again. Reusing that artifact avoids a
++        second back-to-back DTensor ``full_tensor`` collective, which can
++        deadlock after the rollout update handshake on FSDP2.
++
++        Returns whether a scheduled save was performed.
++        """
++        if not self.freq_ctl.check(
++            epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
++        ):
++            return False
++        if not os.path.isdir(source_path):
++            raise FileNotFoundError(
++                f"Existing HF checkpoint source does not exist: {source_path}"
++            )
++        path = Saver.get_model_save_path(
++            self.config.experiment_name,
++            self.config.trial_name,
++            self.config.fileroot,
++            epoch,
++            step,
++            global_step,
++            name,
++        )
++        shutil.copytree(source_path, path, dirs_exist_ok=True)
++        logger.info("Published existing HF checkpoint %s -> %s", source_path, path)
++        return True
++
+     def _async_save(
+         self,
+         engine: TrainEngine | TrainController,
+diff --git a/areal/utils/stats_tracker.py b/areal/utils/stats_tracker.py
+index 844036f..fc06f5d 100644
+--- a/areal/utils/stats_tracker.py
++++ b/areal/utils/stats_tracker.py
+@@ -236,6 +236,35 @@ class DistributedStatsTracker:
+             device=device,
+         )
+ 
++    @staticmethod
++    def _all_reduce_scalar(tensor, group, op=None):
++        """Reduce a scalar on the device supported by ``group``.
++
++        Training statistics are often produced as CUDA tensors, while a
++        caller may deliberately use a Gloo group to keep bookkeeping
++        collectives off the training NCCL stream.  In that case only the
++        already-aggregated scalar is staged to CPU; the potentially large
++        per-token tensors remain on their original device.
++        """
++        if group is None:
++            return tensor
++
++        try:
++            backend = str(dist.get_backend(group)).lower()
++        except (AttributeError, RuntimeError, TypeError, ValueError):
++            # Tests and third-party process-group shims may use opaque group
++            # sentinels. Preserve the historical behavior for those groups.
++            backend = ""
++
++        if backend == "gloo" and tensor.device.type != "cpu":
++            tensor = tensor.cpu()
++
++        if op is None:
++            dist.all_reduce(tensor, group=group)
++        else:
++            dist.all_reduce(tensor, group=group, op=op)
++        return tensor
++
+     def _local_metadata(self, keys: list[str]) -> dict[str, _StatMetadata]:
+         return {
+             key: _StatMetadata(
+@@ -392,8 +421,8 @@ class DistributedStatsTracker:
+                 fill=float(len(stats)), group=effective_group
+             )
+             if effective_group is not None:
+-                dist.all_reduce(value, group=effective_group)
+-                dist.all_reduce(cnt, group=effective_group)
++                value = self._all_reduce_scalar(value, effective_group)
++                cnt = self._all_reduce_scalar(cnt, effective_group)
+             result[key] = float(value / cnt) if float(cnt) > 0 else 0.0
+             result[key + "__count"] = int(cnt)
+         else:
+@@ -418,7 +447,7 @@ class DistributedStatsTracker:
+         if not values:
+             x = self._placeholder_scalar(group=effective_group)
+             if effective_group is not None:
+-                dist.all_reduce(x, group=effective_group)
++                x = self._all_reduce_scalar(x, effective_group)
+             return float(x)
+ 
+         metadata = sync_metadata.get(key) if sync_metadata is not None else None
+@@ -429,7 +458,7 @@ class DistributedStatsTracker:
+         if denominator is None:
+             x = sum([x.sum() for x in values], self._placeholder_scalar(like=values[0]))
+             if effective_group is not None:
+-                dist.all_reduce(x, group=effective_group)
++                x = self._all_reduce_scalar(x, effective_group)
+         else:
+             if denominator not in self.stats:
+                 raise ValueError(
+@@ -440,7 +469,7 @@ class DistributedStatsTracker:
+                 xs.append(torch.where(d, v, 0.0).sum())
+             x = sum(xs, self._placeholder_scalar(like=values[0]))
+             if effective_group is not None:
+-                dist.all_reduce(x, group=effective_group)
++                x = self._all_reduce_scalar(x, effective_group)
+         return float(x)
+ 
+     def _denominator_of(
+@@ -470,8 +499,8 @@ class DistributedStatsTracker:
+             x = self._placeholder_scalar(group=effective_group)
+             d = self._placeholder_scalar(group=effective_group)
+             if effective_group is not None:
+-                dist.all_reduce(x, group=effective_group)
+-                dist.all_reduce(d, group=effective_group)
++                x = self._all_reduce_scalar(x, effective_group)
++                d = self._all_reduce_scalar(d, effective_group)
+             if d == 0:
+                 return None
+             return x / d
+@@ -490,8 +519,8 @@ class DistributedStatsTracker:
+             key, reduce_group, sync_metadata, key_sync_group
+         )
+         if effective_group is not None:
+-            dist.all_reduce(x, group=effective_group)
+-            dist.all_reduce(d, group=effective_group)
++            x = self._all_reduce_scalar(x, effective_group)
++            d = self._all_reduce_scalar(d, effective_group)
+         if d == 0:
+             return None
+         return x / d
+@@ -510,7 +539,9 @@ class DistributedStatsTracker:
+             )
+             x = self._placeholder_scalar(fill=float("inf"), group=effective_group)
+             if effective_group is not None:
+-                dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
++                x = self._all_reduce_scalar(
++                    x, effective_group, op=dist.ReduceOp.MIN
++                )
+             if torch.isinf(x):
+                 return None
+             return float(x)
+@@ -526,7 +557,7 @@ class DistributedStatsTracker:
+             key, reduce_group, sync_metadata, key_sync_group
+         )
+         if effective_group is not None:
+-            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
++            x = self._all_reduce_scalar(x, effective_group, op=dist.ReduceOp.MIN)
+         if torch.isinf(x):
+             return None
+         return float(x)
+@@ -545,7 +576,9 @@ class DistributedStatsTracker:
+             )
+             x = self._placeholder_scalar(fill=-float("inf"), group=effective_group)
+             if effective_group is not None:
+-                dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
++                x = self._all_reduce_scalar(
++                    x, effective_group, op=dist.ReduceOp.MAX
++                )
+             if torch.isinf(x):
+                 return None
+             return float(x)
+@@ -561,7 +594,7 @@ class DistributedStatsTracker:
+             key, reduce_group, sync_metadata, key_sync_group
+         )
+         if effective_group is not None:
+-            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
++            x = self._all_reduce_scalar(x, effective_group, op=dist.ReduceOp.MAX)
+         if torch.isinf(x):
+             return None
+         return float(x)
+diff --git a/areal/utils/timeutil.py b/areal/utils/timeutil.py
+index d0a72fc..1727115 100644
+--- a/areal/utils/timeutil.py
++++ b/areal/utils/timeutil.py
+@@ -24,6 +24,7 @@ class FrequencyControl:
+         frequency_steps: int | None = None,
+         initial_value: bool = False,
+         group: dist.ProcessGroup | None = None,
++        synchronize: bool = True,
+     ):
+         """Initialization method of FrequencyControl.
+         Args:
+@@ -33,6 +34,9 @@ class FrequencyControl:
+             group: If torch distributed is initialized, time intervals will be synchronized
+                 across processes in the specified distributed group. If group is None, the
+                 default process group will be used.
++            synchronize: Disable distributed synchronization for thread-local timers.
++                Background services must set this to False: asynchronous collectives on
++                the model process group can interleave with training collectives.
+ 
+         NOTE:
+             - If both frequency_seconds and frequency_steps are None, the checking will always return False except
+@@ -43,6 +47,7 @@ class FrequencyControl:
+         self.frequency_seconds = frequency_seconds
+         self.frequency_steps = frequency_steps
+         self.group = group
++        self.synchronize = synchronize
+         self.__start_time = datetime.now()
+         self.__steps = 0
+         self.__last_time = datetime.now()
+@@ -62,6 +67,7 @@ class FrequencyControl:
+             interval_steps=self.__interval_steps,
+             interval_seconds=self.__interval_seconds,
+             initial_value=self.__initial_value,
++            synchronize=self.synchronize,
+         )
+ 
+     def load_state_dict(self, state_dict):
+@@ -74,6 +80,7 @@ class FrequencyControl:
+         self.__interval_steps = state_dict["interval_steps"]
+         self.__interval_seconds = state_dict["interval_seconds"]
+         self.__initial_value = state_dict["initial_value"]
++        self.synchronize = state_dict.get("synchronize", True)
+ 
+     @property
+     def total_seconds(self):
+@@ -115,7 +122,8 @@ class FrequencyControl:
+             if self.frequency_steps is None and self.frequency_seconds is None:
+                 return False
+             if self.frequency_seconds is not None:
+-                if dist.is_initialized():
++                interval_seconds = self.__interval_seconds
++                if self.synchronize and dist.is_initialized():
+                     interval_seconds = torch.tensor(
+                         self.__interval_seconds, device=current_platform.device_type
+                     )
+diff --git a/areal/v2/inference_service/sglang/scheduler.py b/areal/v2/inference_service/sglang/scheduler.py
+index 57ce2db..46ee950 100644
+--- a/areal/v2/inference_service/sglang/scheduler.py
++++ b/areal/v2/inference_service/sglang/scheduler.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ import logging
+ import os
++import re
+ import tempfile
+ from typing import Any
+ 
+@@ -16,6 +17,109 @@ from areal.infra.rpc.serialization import serialize_value
+ 
+ RESULT_IPC_ENV = "AREAL_AWEX_RESULT_IPC"
+ 
++_QWEN35_DIRECT_ATTN_LORA_PATTERN = re.compile(
++    r"^model\.layers\.\d+\.(?:qkv_proj|o_proj)$"
++)
++
++
++def _qwen35_family_lora_hidden_dim(text_config: Any, module_name: str) -> tuple[int, int]:
++    """Return LoRA dimensions for the Qwen3.5 implementation used by Qwen3.6."""
++    hidden_size = int(text_config.hidden_size)
++    num_attention_heads = int(text_config.num_attention_heads)
++    num_key_value_heads = int(text_config.num_key_value_heads)
++    head_dim = int(
++        getattr(text_config, "head_dim", hidden_size // num_attention_heads)
++    )
++
++    if module_name == "qkv_proj":
++        # Qwen3.6's q_proj jointly emits query and attention-output gate values.
++        q_multiplier = 2 if getattr(text_config, "attn_output_gate", False) else 1
++        output_size = head_dim * (
++            num_attention_heads * q_multiplier + 2 * num_key_value_heads
++        )
++        return hidden_size, output_size
++    if module_name == "o_proj":
++        return head_dim * num_attention_heads, hidden_size
++    if module_name == "gate_up_proj":
++        return hidden_size, int(text_config.intermediate_size) * 2
++    if module_name == "down_proj":
++        return int(text_config.intermediate_size), hidden_size
++    if module_name == "embed_tokens":
++        return int(text_config.vocab_size), hidden_size
++    if module_name == "lm_head":
++        return hidden_size, int(text_config.vocab_size)
++    raise NotImplementedError(f"Qwen3.6 LoRA dimensions are unknown for {module_name}")
++
++
++def _enable_nested_text_config_lora_compat() -> None:
++    """Let SGLang LoRA consume composite configs used by Qwen3.6.
++
++    SGLang's LoRA manager expects language-model fields (``vocab_size``,
++    ``hidden_size``, and ``num_hidden_layers``) on the top-level HF config.
++    Composite configs keep those fields under ``text_config``.  Preserve the
++    composite config for the model runner, but pass its text config while the
++    LoRA manager is constructed.  The same compatibility layer supplies the
++    gated-Q dimensions that SGLang's generic fallback cannot infer.
++
++    Qwen3.6 currently reuses the Qwen3.5 implementation in Transformers and
++    SGLang.  Its full-attention layer stores ``qkv_proj`` and ``o_proj``
++    directly below ``model.layers.N``.  The inherited multimodal LoRA filter
++    only accepts an extra ``self_attn`` component, so those modules are not
++    wrapped and their TP weights are never sharded.  Extend the filter only
++    while constructing the LoRA manager; the existing SGLang LoRA wrappers
++    then perform the normal row/column-parallel slicing.
++    """
++    from sglang.srt.model_executor.model_runner import ModelRunner
++
++    original = ModelRunner.init_lora_manager
++    if getattr(original, "_areal_nested_text_config_compat", False):
++        return
++
++    def init_lora_manager(model_runner):
++        hf_config = model_runner.model_config.hf_config
++        text_config = getattr(hf_config, "text_config", None)
++        if text_config is None or hasattr(hf_config, "vocab_size"):
++            return original(model_runner)
++
++        base_model = model_runner.model
++        original_filter = getattr(base_model, "should_apply_lora", None)
++        filter_extended = callable(original_filter)
++        if filter_extended:
++
++            def should_apply_lora(module_name):
++                return original_filter(module_name) or bool(
++                    _QWEN35_DIRECT_ATTN_LORA_PATTERN.match(module_name)
++                )
++
++            base_model.should_apply_lora = should_apply_lora
++
++        original_hidden_dim = getattr(base_model, "get_hidden_dim", None)
++        hidden_dim_extended = bool(getattr(text_config, "attn_output_gate", False))
++        if hidden_dim_extended:
++
++            def get_hidden_dim(module_name, layer_idx):
++                if module_name == "qkv_proj" or original_hidden_dim is None:
++                    return _qwen35_family_lora_hidden_dim(text_config, module_name)
++                return original_hidden_dim(module_name, layer_idx)
++
++            base_model.get_hidden_dim = get_hidden_dim
++
++        model_runner.model_config.hf_config = text_config
++        try:
++            return original(model_runner)
++        finally:
++            model_runner.model_config.hf_config = hf_config
++            if filter_extended:
++                base_model.should_apply_lora = original_filter
++            if hidden_dim_extended:
++                if original_hidden_dim is None:
++                    delattr(base_model, "get_hidden_dim")
++                else:
++                    base_model.get_hidden_dim = original_hidden_dim
++
++    init_lora_manager._areal_nested_text_config_compat = True
++    ModelRunner.init_lora_manager = init_lora_manager
++
+ 
+ class AwexSchedulerBridge:
+     """Compose awex weight-update capabilities onto a plain Scheduler instance.
+@@ -191,6 +295,7 @@ def areal_run_scheduler_process(
+     )
+ 
+     logger = logging.getLogger(__name__)
++    _enable_nested_text_config_lora_compat()
+     dp_rank = configure_scheduler(
+         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+     )
+diff --git a/tests/test_engine_blueprint_offload_broadcast.py b/tests/test_engine_blueprint_offload_broadcast.py
+index 74cac05..7c82e59 100644
+--- a/tests/test_engine_blueprint_offload_broadcast.py
++++ b/tests/test_engine_blueprint_offload_broadcast.py
+@@ -2,7 +2,11 @@
+ 
+ from types import SimpleNamespace
+ 
+-from areal.infra.rpc.guard.engine_blueprint import resolve_broadcast_target
++from areal.infra.rpc.guard import engine_blueprint
++from areal.infra.rpc.guard.engine_blueprint import (
++    _broadcast_group_has_peers,
++    resolve_broadcast_target,
++)
+ 
+ 
+ def _engine(is_offload: bool, with_cpu_group: bool):
+@@ -38,3 +42,23 @@ def test_resident_engine_keeps_device_broadcast():
+     )
+     assert group == "device-group"
+     assert device == "cuda:0"
++
++
++def test_default_process_group_keeps_payload_broadcast(monkeypatch):
++    """None means the default group, not a singleton group."""
++
++    def unexpected_world_size(_group):
++        raise AssertionError("default process group size should not be queried")
++
++    monkeypatch.setattr(engine_blueprint.dist, "get_world_size", unexpected_world_size)
++    assert _broadcast_group_has_peers(None)
++
++
++def test_singleton_group_skips_payload_broadcast(monkeypatch):
++    monkeypatch.setattr(engine_blueprint.dist, "get_world_size", lambda _group: 1)
++    assert not _broadcast_group_has_peers("singleton-group")
++
++
++def test_multi_rank_group_keeps_payload_broadcast(monkeypatch):
++    monkeypatch.setattr(engine_blueprint.dist, "get_world_size", lambda _group: 4)
++    assert _broadcast_group_has_peers("model-parallel-group")
+diff --git a/tests/test_functional.py b/tests/test_functional.py
+index 6705b52..17961f3 100644
+--- a/tests/test_functional.py
++++ b/tests/test_functional.py
+@@ -8,6 +8,41 @@ from areal.utils.functional import (
+ )
+ 
+ 
++@pytest.mark.parametrize("packed", [False, True])
++def test_ppo_sequence_mean_gives_actions_equal_weight(packed: bool) -> None:
++    """Longer actions must not receive a larger total policy gradient weight."""
++
++    if packed:
++        shape = (6,)
++        loss_mask = torch.tensor([True, True, True, True, True, True])
++        advantages = torch.tensor([1.0, 1.0, 3.0, 3.0, 3.0, 3.0])
++        cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
++    else:
++        shape = (2, 4)
++        loss_mask = torch.tensor(
++            [[True, True, False, False], [True, True, True, True]]
++        )
++        advantages = torch.tensor(
++            [[1.0, 1.0, 0.0, 0.0], [3.0, 3.0, 3.0, 3.0]]
++        )
++        cu_seqlens = None
++
++    zeros = torch.zeros(shape)
++    loss, _ = ppo_actor_loss_fn(
++        logprobs=zeros,
++        proximal_logprobs=zeros,
++        old_logprobs=zeros,
++        advantages=advantages,
++        eps_clip=0.2,
++        loss_mask=loss_mask,
++        cu_seqlens=cu_seqlens,
++        loss_reduction="sequence_mean",
++    )
++
++    # Ratio is one, so this is -mean([action advantage 1, action advantage 3]).
++    torch.testing.assert_close(loss, torch.tensor(-2.0), rtol=0.0, atol=0.0)
++
++
+ class TestPPOActorLossFnSequenceLevel:
+     """Test cases for ppo_actor_loss_fn with importance_sampling_level='sequence'."""
+ 
+@@ -485,6 +520,12 @@ class TestPPOActorLossFnSequenceLevel:
+         # Should have behavior stats
+         assert "behave_imp_weight" in stat
+         assert "behave_approx_kl" in stat
++        assert "behave_imp_weight_applied" in stat
++        assert "behave_imp_weight_sq" in stat
++        assert "behave_ratio_below_0_5" in stat
++        assert "behave_ratio_above_2" in stat
++        assert "behave_ratio_above_5" in stat
++        assert "behave_k3" in stat
+         assert "behave_mask" in stat
+         assert "filtered_fraction" in stat
+ 
+@@ -492,6 +533,38 @@ class TestPPOActorLossFnSequenceLevel:
+         assert not torch.isnan(loss)
+         assert not torch.isinf(loss)
+ 
++    def test_rejection_sampling_reports_pre_filter_tail_diagnostics(self):
++        old_logprobs = torch.zeros(1, 4)
++        proximal_logprobs = torch.log(torch.tensor([[0.25, 3.0, 6.0, 1.0]]))
++        loss_mask = torch.ones(1, 4, dtype=torch.bool)
++
++        _, stat = ppo_actor_loss_fn(
++            logprobs=proximal_logprobs.clone(),
++            proximal_logprobs=proximal_logprobs,
++            old_logprobs=old_logprobs,
++            advantages=torch.ones(1, 4),
++            eps_clip=0.2,
++            loss_mask=loss_mask,
++            rejection_sampling=RejectionSamplingConfig(metric="ratio", upper=5.0),
++        )
++
++        torch.testing.assert_close(
++            stat["behave_ratio_below_0_5"], torch.tensor([[1.0, 0.0, 0.0, 0.0]])
++        )
++        torch.testing.assert_close(
++            stat["behave_ratio_above_2"], torch.tensor([[0.0, 1.0, 1.0, 0.0]])
++        )
++        torch.testing.assert_close(
++            stat["behave_ratio_above_5"], torch.tensor([[0.0, 0.0, 1.0, 0.0]])
++        )
++        # The ratio-6 token is rejected by the configured upper bound, while
++        # the diagnostics above still retain its pre-filter classification.
++        torch.testing.assert_close(
++            stat["behave_imp_weight_applied"],
++            torch.tensor([[0.25, 3.0, 0.0, 1.0]]),
++        )
++        assert torch.isfinite(stat["behave_k3"]).all()
++
+     def test_no_rejection_sampling_excludes_behave_stats(self):
+         """When rejection_sampling=None, stat should not contain behave keys."""
+         batch_size = 2
+diff --git a/tests/test_grouped_rollout_workflow.py b/tests/test_grouped_rollout_workflow.py
+index cee294d..a21fce6 100644
+--- a/tests/test_grouped_rollout_workflow.py
++++ b/tests/test_grouped_rollout_workflow.py
+@@ -7,7 +7,7 @@ import torch
+ 
+ from areal.api import RolloutWorkflow
+ from areal.experimental.openai import InteractionWithTokenLogpReward
+-from areal.infra import dist_rollout
++from areal.infra import dist_rollout, workflow_context
+ from areal.infra.dist_rollout import DistRolloutCoordinator
+ from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
+ 
+@@ -50,6 +50,12 @@ class _RolloutEngine:
+         return [{"trajectory": True}]
+ 
+ 
++class _ContextWorkflow(RolloutWorkflow):
++    async def arun_episode(self, engine, data):
++        context = workflow_context.get()
++        return {"sample_idx": torch.tensor([context.sample_idx])}
++
++
+ def _interaction(reward: float) -> InteractionWithTokenLogpReward:
+     return InteractionWithTokenLogpReward(
+         reward=reward,
+@@ -64,6 +70,19 @@ def _interaction(reward: float) -> InteractionWithTokenLogpReward:
+     )
+ 
+ 
++@pytest.mark.asyncio
++async def test_grouped_rollout_assigns_stable_distinct_sample_indices():
++    workflow_context.set(workflow_context.WorkflowContext(task_id=17))
++    workflow = GroupedRolloutWorkflow(
++        _ContextWorkflow(), group_size=4, logger=_Logger()
++    )
++
++    result = await workflow.arun_episode(engine=None, data={})
++
++    assert result is not None
++    assert result["sample_idx"].tolist() == [0, 1, 2, 3]
++
++
+ @pytest.mark.asyncio
+ async def test_grouped_rollout_workflow_normalizes_rewards_and_updates_cache():
+     first = _interaction(1.0)
+@@ -90,6 +109,52 @@ async def test_grouped_rollout_workflow_normalizes_rewards_and_updates_cache():
+     assert second._cache["original_rewards"].item() == pytest.approx(3.0)
+ 
+ 
++@pytest.mark.asyncio
++async def test_grouped_rollout_normalizes_terminal_only_then_adds_process_credit():
++    first_turn = _interaction(-0.975)
++    first_turn.episode_reward = -1.0
++    first_turn.process_reward = 0.025
++    second_turn = _interaction(-1.05)
++    second_turn.episode_reward = -1.0
++    second_turn.process_reward = -0.05
++    other = _interaction(-1.0)
++    other.episode_reward = -1.0
++    other.process_reward = 0.0
++    workflow = GroupedRolloutWorkflow(
++        _ListWorkflow([{"a": first_turn, "b": second_turn}, {"c": other}]),
++        group_size=2,
++        logger=_Logger(),
++        reward_normalization=True,
++    )
++
++    result = await workflow.arun_episode(engine=None, data={})
++
++    assert result == {"a": first_turn, "b": second_turn, "c": other}
++    assert first_turn.reward == pytest.approx(0.025)
++    assert second_turn.reward == pytest.approx(-0.05)
++    assert other.reward == pytest.approx(0.0)
++    assert first_turn.original_reward == pytest.approx(-1.0)
++    assert first_turn._cache["rewards"].item() == pytest.approx(0.025)
++    assert second_turn._cache["rewards"].item() == pytest.approx(-0.05)
++    assert other._cache["original_rewards"].item() == pytest.approx(-1.0)
++
++
++@pytest.mark.asyncio
++async def test_grouped_rollout_drops_mixed_credit_assignment_metadata():
++    logger = _Logger()
++    with_credit = _interaction(1.0)
++    with_credit.episode_reward = 1.0
++    workflow = GroupedRolloutWorkflow(
++        _ListWorkflow([{"a": with_credit}, {"b": _interaction(2.0)}]),
++        group_size=2,
++        logger=logger,
++        reward_normalization=True,
++    )
++
++    assert await workflow.arun_episode(engine=None, data={}) is None
++    assert any("mixed episode-reward metadata" in message for message in logger.messages)
++
++
+ @pytest.mark.asyncio
+ async def test_grouped_rollout_workflow_drops_incomplete_group():
+     logger = _Logger()
+diff --git a/tests/test_inference_engines.py b/tests/test_inference_engines.py
+index ad00296..65154ee 100644
+--- a/tests/test_inference_engines.py
++++ b/tests/test_inference_engines.py
+@@ -95,6 +95,7 @@ def inference_engine(request):
+         tp_size=1,
+         pp_size=1,
+     )
++    assert vllm_args["logprobs_mode"] == "raw_logprobs"
+ 
+     # Launch remote server and initialize engine
+     if backend == "vllm":
+diff --git a/tests/test_ppo_stats.py b/tests/test_ppo_stats.py
+index dba4b02..e1dd9b2 100644
+--- a/tests/test_ppo_stats.py
++++ b/tests/test_ppo_stats.py
+@@ -2,7 +2,11 @@ from unittest.mock import MagicMock, patch
+ 
+ import torch
+ 
+-from areal.trainer.ppo.actor import _infer_prompt_lens, grpo_loss_fn
++from areal.trainer.ppo.actor import (
++    _infer_prompt_lens,
++    _policy_loss_weight,
++    grpo_loss_fn,
++)
+ from areal.trainer.ppo.critic import ppo_loss_fn
+ from areal.trainer.ppo.stats import infer_token_denominator
+ from areal.utils.stats_tracker import DistributedStatsTracker
+@@ -87,6 +91,17 @@ def test_grpo_loss_fn_uses_full_cu_seqlens_for_n_tokens():
+     assert torch.all(n_tokens)
+ 
+ 
++def test_sequence_loss_weight_accepts_qwen_packed_boundary_alias():
++    input_data = {
++        "loss_mask": torch.tensor([False, True, False, True, True]),
++        "cu_seq_lens_q": torch.tensor([0, 2, 5], dtype=torch.int32),
++    }
++
++    weight = _policy_loss_weight(input_data, "sequence_mean")
++
++    torch.testing.assert_close(weight, torch.tensor(2), rtol=0.0, atol=0.0)
++
++
+ def test_critic_loss_fn_uses_full_cu_seqlens_for_n_tokens():
+     input_data = {
+         "input_ids": torch.tensor([11, 12]),
+diff --git a/tests/test_recover.py b/tests/test_recover.py
+index 7e4c80c..4020ce4 100644
+--- a/tests/test_recover.py
++++ b/tests/test_recover.py
+@@ -198,6 +198,36 @@ class TestRecoverHandler:
+     def _make_gateway_controller() -> GatewayTrainController:
+         return GatewayTrainController.__new__(GatewayTrainController)
+ 
++    def test_frequency_restore_honors_current_config(self, tmp_path):
++        old_config = RecoverConfig(
++            experiment_name="test_exp",
++            trial_name="test_trial",
++            fileroot=str(tmp_path),
++            mode="auto",
++            freq_steps=2,
++        )
++        ft_spec = FinetuneSpec(
++            total_train_epochs=1,
++            dataset_size=8,
++            train_batch_size=2,
++        )
++        old_handler = RecoverHandler(old_config, ft_spec)
++        assert not old_handler.freq_ctl.check(epochs=0, steps=1)
++        assert old_handler.freq_ctl.check(epochs=0, steps=1)
++
++        new_config = RecoverConfig(
++            experiment_name="test_exp",
++            trial_name="test_trial",
++            fileroot=str(tmp_path),
++            mode="auto",
++            freq_steps=1,
++        )
++        new_handler = RecoverHandler(new_config, ft_spec)
++        new_handler._load_frequency_state(old_handler.freq_ctl.state_dict())
++
++        assert new_handler.freq_ctl.step_ctl.frequency_steps == 1
++        assert new_handler.freq_ctl.check(epochs=0, steps=1)
++
+     @pytest.mark.parametrize("mode", ["on", "auto"])
+     def test_load_rejects_gateway_train_controller(self, mode):
+         with tempfile.TemporaryDirectory() as tmpdir:
+diff --git a/tests/test_seqpack.py b/tests/test_seqpack.py
+index 02cf3f9..a934708 100644
+--- a/tests/test_seqpack.py
++++ b/tests/test_seqpack.py
+@@ -8,7 +8,7 @@ import torch
+ 
+ from areal.api import TrainEngine
+ from areal.api.alloc_mode import ModelAllocation
+-from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
++from areal.api.cli_args import MicroBatchSpec, SchedulingSpec, TrainEngineConfig
+ from areal.infra import TrainController
+ from areal.infra.controller.train_controller import (
+     _dispatch_tensors,
+@@ -16,6 +16,7 @@ from areal.infra.controller.train_controller import (
+ )
+ from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+ from areal.utils.data import (
++    allocate_balanced_mbs_synced,
+     concat_padded_tensors,
+     split_and_unpad_tensor,
+ )
+@@ -458,6 +459,65 @@ class TestFFDAllocate:
+             ffd_allocate(values, capacity, min_groups)
+ 
+ 
++class TestSyncedMicroBatchAllocation:
++    """Distributed packing must fail consistently when no common count exists."""
++
++    @staticmethod
++    def _mock_distributed_stats(monkeypatch, remote_stats):
++        monkeypatch.setattr("areal.utils.data.dist.is_initialized", lambda: True)
++        monkeypatch.setattr(
++            "areal.utils.data.dist.get_world_size", lambda group=None: 2
++        )
++
++        def _all_gather_object(output, local_stats, group=None):
++            output[:] = [local_stats, remote_stats]
++
++        monkeypatch.setattr(
++            "areal.utils.data.dist.all_gather_object", _all_gather_object
++        )
++
++    def test_sync_reallocates_to_feasible_common_count(self, monkeypatch):
++        self._mock_distributed_stats(monkeypatch, remote_stats=(3, 4))
++        spec = MicroBatchSpec(n_mbs=1, max_tokens_per_mb=200)
++
++        groups = allocate_balanced_mbs_synced(spec, [100, 100, 100, 100])
++
++        assert len(groups) == 3
++        assert sorted(i for group in groups for i in group) == [0, 1, 2, 3]
++
++    def test_sync_reports_infeasible_rank_sequence_counts(self, monkeypatch):
++        self._mock_distributed_stats(monkeypatch, remote_stats=(5, 10))
++        spec = MicroBatchSpec(n_mbs=1, max_tokens_per_mb=100)
++
++        with pytest.raises(
++            RuntimeError,
++            match=r"natural micro-batch counts=\[4, 5\].*sequence-group counts=\[4, 10\]",
++        ):
++            allocate_balanced_mbs_synced(spec, [100, 100, 100, 100])
++
++    def test_sync_splits_natural_bins_when_ffd_minimum_overshoots(self, monkeypatch):
++        # Natural FFD uses 26 bins, but asking FFD for min_groups=27 returns
++        # 28. The synchronized path must split one valid natural bin instead
++        # of treating a minimum as an exact-count allocator.
++        values = [
++            134, 128, 127, 141, 217, 337, 12, 100, 142, 45, 45, 317,
++            90, 130, 57, 332, 294, 111, 175, 57, 120, 142, 87, 262,
++            73, 90, 226, 280, 295, 183, 155, 148, 122, 204, 10, 33,
++            246, 93, 290, 248, 139, 73, 103, 108, 290, 89, 278, 81,
++            209, 69, 86, 233, 215, 41, 160, 54,
++        ]
++        self._mock_distributed_stats(monkeypatch, remote_stats=(27, len(values)))
++        spec = MicroBatchSpec(n_mbs=1, max_tokens_per_mb=341)
++
++        groups = allocate_balanced_mbs_synced(spec, values)
++
++        assert len(groups) == 27
++        assert sorted(index for group in groups for index in group) == list(
++            range(len(values))
++        )
++        assert all(sum(values[index] for index in group) <= 341 for group in groups)
++
++
+ # =============================================================================
+ # Integration Tests: _dispatch_tensors
+ # =============================================================================
+diff --git a/tests/test_stats_tracker.py b/tests/test_stats_tracker.py
+index 96154b8..7ec4586 100644
+--- a/tests/test_stats_tracker.py
++++ b/tests/test_stats_tracker.py
+@@ -1,3 +1,4 @@
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import torch
+@@ -10,6 +11,27 @@ from areal.utils.stats_tracker import (
+ )
+ 
+ 
++def test_all_reduce_scalar_stages_cuda_value_for_gloo_group():
++    tracker = DistributedStatsTracker()
++    group = object()
++    cpu_tensor = SimpleNamespace(device=SimpleNamespace(type="cpu"))
++
++    class FakeCudaTensor:
++        device = SimpleNamespace(type="cuda")
++
++        def cpu(self):
++            return cpu_tensor
++
++    with (
++        patch("areal.utils.stats_tracker.dist.get_backend", return_value="gloo"),
++        patch("areal.utils.stats_tracker.dist.all_reduce") as all_reduce,
++    ):
++        result = tracker._all_reduce_scalar(FakeCudaTensor(), group)
++
++    assert result is cpu_tensor
++    all_reduce.assert_called_once_with(cpu_tensor, group=group)
++
++
+ def test_export_uses_key_sync_group_for_missing_per_key_stat():
+     tracker = DistributedStatsTracker()
+     dp_group = object()
+diff --git a/tests/test_train_controller.py b/tests/test_train_controller.py
+index 45ea206..31a3491 100644
+--- a/tests/test_train_controller.py
++++ b/tests/test_train_controller.py
+@@ -20,7 +20,12 @@ from areal.api import (
+ )
+ from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
+ from areal.infra import TrainController
+-from areal.infra.controller.train_controller import _merge_tensors
++from areal.infra.controller.train_controller import (
++    _dispatch_tensors,
++    _merge_local_worker_stats,
++    _merge_tensors,
++)
++from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+ 
+ 
+ class MockTrainEngine(TrainEngine):
+@@ -241,6 +246,14 @@ class TestTrainControllerDestroy:
+         assert len(train_controller.workers) == 0
+         assert len(train_controller.workers_is_dp_head) == 0
+         assert "train_worker" in train_controller.scheduler.deleted_roles
++        destroy_calls = [
++            kwargs
++            for _, method, _, kwargs in train_controller.scheduler.engine_calls
++            if method == "destroy"
++        ]
++        assert destroy_calls
++        assert all(call["http_timeout"] == 120.0 for call in destroy_calls)
++        assert all(call["max_retries"] == 1 for call in destroy_calls)
+ 
+     def test_destroy_handles_errors(self, train_controller, ft_spec):
+         """Test destroy handles errors gracefully."""
+@@ -320,6 +333,13 @@ class TestTrainControllerRPCWrappers:
+         # Verify custom_function_call was invoked
+         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
+         assert "train" in engine_calls
++        train_calls = [
++            call
++            for call in train_controller.scheduler.engine_calls
++            if call[1] == "train"
++        ]
++        assert train_calls
++        assert all(call[3]["max_retries"] == 1 for call in train_calls)
+ 
+     def test_eval_mode(self, train_controller, ft_spec):
+         """Test eval() method sets evaluation mode."""
+@@ -367,6 +387,44 @@ class TestTrainControllerWeightManagement:
+         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
+         assert "set_version" in engine_calls
+ 
++    def test_set_version_skips_payload_broadcast_for_pure_dp(
++        self, mock_scheduler, ft_spec
++    ):
++        """Pure-DP workers already receive replicated scalar RPC arguments."""
++        config = TrainEngineConfig(
++            backend="fsdp:d8t1",
++            scheduling_spec=(
++                SchedulingSpec(
++                    cpu=4,
++                    gpu=1,
++                    mem=16000,
++                    port_count=2,
++                    cmd="python -m areal.infra.rpc.rpc_server",
++                ),
++            ),
++        )
++        controller = TrainController(
++            train_engine=MockTrainEngine, config=config, scheduler=mock_scheduler
++        )
++        try:
++            controller.initialize(role="train_worker", ft_spec=ft_spec)
++            # The generic mock marks alternating workers as heads; the d8t1
++            # production topology marks every worker as a DP head.
++            controller.workers_is_dp_head = [True] * len(controller.workers)
++            controller.scheduler.engine_calls.clear()
++
++            controller.set_version(42)
++
++            calls = [
++                call
++                for call in controller.scheduler.engine_calls
++                if call[1] == "set_version"
++            ]
++            assert calls
++            assert all(call[3]["rpc_meta"] == {"broadcast": False} for call in calls)
++        finally:
++            controller.destroy()
++
+     def test_get_version(self, train_controller, ft_spec):
+         """Test get_version() method."""
+         train_controller.initialize(
+@@ -656,14 +714,19 @@ class TestTrainControllerExportStats:
+     """Tests for export_stats method."""
+ 
+     def test_export_stats(self, train_controller, ft_spec):
+-        """Test export_stats returns statistics from first worker."""
++        """Test scalar statistics are merged across DP heads by count."""
+         train_controller.initialize(
+             role="train_worker",
+             ft_spec=ft_spec,
+         )
+ 
+         # Mock the scheduler to return stats
+-        expected_stats = {"loss": 0.5, "accuracy": 0.95}
++        expected_stats = {
++            "loss": 0.5,
++            "loss__count": 2,
++            "accuracy": 0.95,
++            "accuracy__count": 2,
++        }
+ 
+         async def mock_async_call(*args, **kwargs):
+             if kwargs.get("method") == "export_stats" or (
+@@ -676,7 +739,54 @@ class TestTrainControllerExportStats:
+ 
+         result = train_controller.export_stats()
+         for k in expected_stats:
+-            assert result[k] == expected_stats[k]
++            if k.endswith("__count"):
++                assert result[k] == expected_stats[k] * 4
++            else:
++                assert result[k] == expected_stats[k]
++
++    def test_export_stats_skips_rpc_payload_broadcast(
++        self, train_controller, ft_spec
++    ):
++        """All workers execute the no-payload stats RPC locally."""
++        train_controller.initialize(role="train_worker", ft_spec=ft_spec)
++        train_controller.scheduler.engine_calls.clear()
++
++        train_controller.export_stats()
++
++        calls = [
++            call for call in train_controller.scheduler.engine_calls if call[1] == "export_stats"
++        ]
++        assert len(calls) == len(train_controller.workers)
++        assert all(call[3]["rpc_meta"] == {"broadcast": False} for call in calls)
++
++    def test_merge_local_worker_stats_reductions(self):
++        merged = _merge_local_worker_stats(
++            [
++                {
++                    "time": 2.0,
++                    "time__count": 1,
++                    "loss/avg": 0.2,
++                    "loss/min": 0.1,
++                    "loss/max": 0.3,
++                    "n_tokens": 10,
++                },
++                {
++                    "time": 4.0,
++                    "time__count": 3,
++                    "loss/avg": 0.6,
++                    "loss/min": 0.4,
++                    "loss/max": 0.8,
++                    "n_tokens": 20,
++                },
++            ]
++        )
++
++        assert merged["time"] == pytest.approx(3.5)
++        assert merged["time__count"] == 4
++        assert merged["loss/avg"] == pytest.approx(0.4)
++        assert merged["loss/min"] == pytest.approx(0.1)
++        assert merged["loss/max"] == pytest.approx(0.8)
++        assert merged["n_tokens"] == 30
+ 
+ 
+ class TestTrainControllerDispatchInputs:
+@@ -723,6 +833,24 @@ class TestTrainControllerDispatchInputs:
+         flat_indices = [idx for group in group_indices for idx in group]
+         assert sorted(flat_indices) == list(range(batch_size))
+ 
++    def test_nested_action_masks_drive_token_balancing(self):
++        """Nested per-action trajectories must not silently receive weight 1."""
++
++        def nested_item(length: int) -> dict:
++            shard = TensorShardInfo(shard_id=str(length), node_addr="")
++            mask = RTensor(
++                shard=shard,
++                data=torch.empty((1, length), dtype=torch.bool, device="meta"),
++            )
++            return {"actions": [{"attention_mask": mask}]}
++
++        lengths = [1000, 900, 800, 700, 100, 90, 80, 70]
++        items = [nested_item(length) for length in lengths]
++        _, indices = _dispatch_tensors(items, dp_size=2)
++        totals = [sum(lengths[index] for index in shard) for shard in indices]
++
++        assert max(totals) - min(totals) <= 100
++
+     def test_prepare_dispatch_replicates_non_batch_args(
+         self, train_controller, ft_spec
+     ):
+diff --git a/tests/test_vllm_generation_request.py b/tests/test_vllm_generation_request.py
+index 18a42d0..c2ef33b 100644
+--- a/tests/test_vllm_generation_request.py
++++ b/tests/test_vllm_generation_request.py
+@@ -18,3 +18,25 @@ def test_vllm_forwards_frequency_penalty_and_stop():
+ 
+     assert payload["frequency_penalty"] == 0.5
+     assert payload["stop"] == ["STOP"]
++
++
++def test_vllm_forwards_optional_request_seed():
++    backend = VLLMBackend()
++    seeded = ModelRequest(
++        input_ids=[11, 12],
++        gconfig=GenerationHyperparameters(max_new_tokens=8, seed=12345),
++    )
++    unseeded = ModelRequest(
++        input_ids=[11, 12],
++        gconfig=GenerationHyperparameters(max_new_tokens=8),
++    )
++
++    seeded_payload = backend.build_generation_request(
++        seeded, with_lora=False, version=0
++    ).payload
++    unseeded_payload = backend.build_generation_request(
++        unseeded, with_lora=False, version=0
++    ).payload
++
++    assert seeded_payload["seed"] == 12345
++    assert "seed" not in unseeded_payload

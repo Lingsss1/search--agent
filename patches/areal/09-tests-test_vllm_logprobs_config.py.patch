@@ -1,0 +1,23 @@
+diff --git a/tests/test_vllm_logprobs_config.py b/tests/test_vllm_logprobs_config.py
+new file mode 100644
+index 0000000..225ffba
+--- /dev/null
++++ b/tests/test_vllm_logprobs_config.py
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from areal.api.cli_args import vLLMConfig
++
++
++def test_processed_logprobs_mode_reaches_vllm_server_command() -> None:
++    config = vLLMConfig(
++        model="test-model",
++        logprobs_mode="processed_logprobs",
++    )
++
++    args = vLLMConfig.build_args(config, tp_size=4, pp_size=1)
++    command = vLLMConfig.build_cmd_from_args(args)
++
++    assert args["logprobs_mode"] == "processed_logprobs"
++    index = command.index("--logprobs-mode")
++    assert command[index + 1] == "processed_logprobs"

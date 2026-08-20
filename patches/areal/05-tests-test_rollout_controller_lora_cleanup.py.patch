@@ -1,0 +1,53 @@
+diff --git a/tests/test_rollout_controller_lora_cleanup.py b/tests/test_rollout_controller_lora_cleanup.py
+new file mode 100644
+index 0000000..c8d571f
+--- /dev/null
++++ b/tests/test_rollout_controller_lora_cleanup.py
+@@ -0,0 +1,47 @@
++import asyncio
++
++from areal.api import WeightUpdateMeta
++from areal.infra import RolloutController
++
++
++def _controller_with_successful_collective():
++    controller = object.__new__(RolloutController)
++
++    async def collective_rpc_async(*args, **kwargs):
++        return None
++
++    controller._collective_rpc_async = collective_rpc_async
++    return controller
++
++
++def test_disk_weight_update_keeps_lazy_lora_files(tmp_path):
++    controller = _controller_with_successful_collective()
++    adapter_dir = tmp_path / "weight_update_v1"
++    adapter_dir.mkdir()
++    adapter_file = adapter_dir / "adapter_model.safetensors"
++    adapter_file.write_bytes(b"adapter")
++    meta = WeightUpdateMeta(
++        type="disk",
++        path=str(adapter_dir),
++        use_lora=True,
++        lora_name="policy",
++        version=1,
++    )
++
++    asyncio.run(controller.update_weights_from_disk(meta))
++
++    assert adapter_dir.is_dir()
++    assert adapter_file.is_file()
++    assert meta.clear_checkpoint_after_load is False
++
++
++def test_disk_weight_update_removes_full_model_files(tmp_path):
++    controller = _controller_with_successful_collective()
++    model_dir = tmp_path / "weight_update_v1"
++    model_dir.mkdir()
++    (model_dir / "model.safetensors").write_bytes(b"model")
++    meta = WeightUpdateMeta(type="disk", path=str(model_dir), use_lora=False)
++
++    asyncio.run(controller.update_weights_from_disk(meta))
++
++    assert not model_dir.exists()

@@ -5,10 +5,15 @@ __pycache__/
 .venv/
 artifacts/
 checkpoints/
+vendor/
 data/raw/
+data/processed/
 data/corpus*.jsonl
 data/indexes/
 predictions*.jsonl
 metrics*.json
 reward_audit*.jsonl
-
+*.log
+.coverage
+build/
+dist/

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openstatesearch"
+version = "0.1.0"
+description = "Reproducible external-state search agent with hybrid retrieval and budget-aware rewards"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.optional-dependencies]
+data = ["huggingface-hub>=0.36", "datasets>=3.0"]
+retriever = ["numpy>=1.24", "torch>=2.2", "transformers>=5.0", "datasets>=3.0"]
+training = ["torch>=2.2", "transformers>=5.0", "torchvision>=0.17", "pillow>=10", "peft>=0.15", "accelerate>=1.8", "pyyaml>=6.0", "openai>=1.66"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+oss36-demo = "openstatesearch.demo:main"
+oss36-eval = "openstatesearch.eval.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["openstatesearch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

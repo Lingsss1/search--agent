@@ -1,0 +1,33 @@
+{
+  "kind": "sft",
+  "model": "artifacts/policy_sft_recovery_step200_merged_seed36",
+  "model_revision": "local-step200-8860a861a3e9cc0cc7b777296029c12527028461d101d4b2237892cecc6c379d",
+  "precision": "bf16",
+  "distributed": "fsdp_8_gpu",
+  "context_length": 8192,
+  "assistant_only_loss": true,
+  "packing": false,
+  "datasets": {"rl_train_legalspace_adaptation": 5250},
+  "lora": {
+    "rank": 16,
+    "alpha": 16,
+    "targets": ["q_proj", "k_proj", "v_proj", "o_proj"]
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "learning_rate": 0.000001,
+    "warmup_ratio": 0.05,
+    "schedule": "cosine",
+    "weight_decay": 0.01
+  },
+  "epochs": 1,
+  "save_steps": 20,
+  "early_stopping": true,
+  "go_gate": {
+    "valid_tool_json": 0.98,
+    "invalid_doc_reference_max": 0.02,
+    "nonempty_search_query": 0.99,
+    "completion_rate": 0.90
+  },
+  "seed": 36
+}

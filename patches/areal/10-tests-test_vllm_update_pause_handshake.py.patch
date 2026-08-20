@@ -1,0 +1,56 @@
+diff --git a/tests/test_vllm_update_pause_handshake.py b/tests/test_vllm_update_pause_handshake.py
+new file mode 100644
+index 0000000..a1c2758
+--- /dev/null
++++ b/tests/test_vllm_update_pause_handshake.py
+@@ -0,0 +1,50 @@
++from types import SimpleNamespace
++
++import pytest
++
++from areal.engine.vllm_ext import areal_vllm_server as server
++
++
++class _FakeEngineClient:
++    def __init__(self):
++        self.pause_calls = 0
++        self.resume_calls = 0
++
++    async def pause_generation(self, **_kwargs):
++        self.pause_calls += 1
++
++    async def reset_mm_cache(self):
++        return None
++
++    async def collective_rpc(self, *_args, **_kwargs):
++        return [(True, "ok")]
++
++    async def resume_generation(self):
++        self.resume_calls += 1
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("externally_paused", "expected_pauses", "expected_resumes"),
++    [(False, 1, 1), (True, 0, 0)],
++)
++async def test_disk_update_preserves_external_pause(
++    externally_paused, expected_pauses, expected_resumes
++):
++    client = _FakeEngineClient()
++    raw_request = SimpleNamespace(
++        app=SimpleNamespace(state=SimpleNamespace(engine_client=client))
++    )
++    request = SimpleNamespace(model_path="/tmp/model")
++
++    if externally_paused:
++        server._generation_run_event.clear()
++    else:
++        server._generation_run_event.set()
++    try:
++        await server.areal_update_weight(request, raw_request)
++    finally:
++        server._generation_run_event.set()
++
++    assert client.pause_calls == expected_pauses
++    assert client.resume_calls == expected_resumes

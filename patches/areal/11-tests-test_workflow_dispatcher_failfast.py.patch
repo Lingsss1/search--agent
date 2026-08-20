@@ -1,0 +1,54 @@
+diff --git a/tests/test_workflow_dispatcher_failfast.py b/tests/test_workflow_dispatcher_failfast.py
+new file mode 100644
+index 0000000..4fc5ef8
+--- /dev/null
++++ b/tests/test_workflow_dispatcher_failfast.py
+@@ -0,0 +1,48 @@
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from areal.infra.workflow_executor import BatchTaskDispatcher
++
++
++class _Runner:
++    max_queue_size = 8
++
++    @staticmethod
++    def get_input_queue_size() -> int:
++        return 0
++
++
++class _StalenessManager:
++    @staticmethod
++    def get_pending_limit() -> int:
++        return 0
++
++
++def test_static_batch_fails_after_full_wave_of_rejections() -> None:
++    dispatcher = object.__new__(BatchTaskDispatcher)
++    dispatcher._input_cv = threading.Condition()
++    dispatcher._pending_inputs = []
++    dispatcher.runner = _Runner()
++    dispatcher.staleness_manager = _StalenessManager()
++    dispatcher.enable_tracing = False
++    dispatcher.wait_results = lambda **_: [None] * 8
++
++    with pytest.raises(RuntimeError, match="refusing to refill forever"):
++        dispatcher.active_submit_and_wait(iter(()), batch_size=8, dynamic_bs=False)
++
++
++def test_dynamic_batch_preserves_one_wave_semantics() -> None:
++    dispatcher = object.__new__(BatchTaskDispatcher)
++    dispatcher._input_cv = threading.Condition()
++    dispatcher._pending_inputs = []
++    dispatcher.runner = _Runner()
++    dispatcher.staleness_manager = _StalenessManager()
++    dispatcher.enable_tracing = False
++    dispatcher.wait_results = lambda **_: [None] * 8
++
++    assert dispatcher.active_submit_and_wait(
++        iter(()), batch_size=8, dynamic_bs=True
++    ) == []

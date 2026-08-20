@@ -1,0 +1,36 @@
+{
+  "kind": "sft",
+  "model": "Qwen/Qwen3.6-27B",
+  "model_revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+  "precision": "bf16",
+  "distributed": "fsdp_8_gpu",
+  "context_length": 8192,
+  "assistant_only_loss": true,
+  "packing": true,
+  "datasets": {
+    "OpenSeeker-v1": 11677,
+    "OpenResearcher-8k-windows": 12000
+  },
+  "lora": {
+    "rank": 16,
+    "alpha": 16,
+    "targets": ["q_proj", "k_proj", "v_proj", "o_proj"]
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "learning_rate": 0.00001,
+    "warmup_ratio": 0.03,
+    "schedule": "cosine",
+    "weight_decay": 0.01
+  },
+  "epochs": 1,
+  "save_steps": 200,
+  "early_stopping": true,
+  "go_gate": {
+    "valid_tool_json": 0.98,
+    "invalid_doc_reference_max": 0.02,
+    "nonempty_search_query": 0.99,
+    "completion_rate": 0.90
+  },
+  "seed": 36
+}

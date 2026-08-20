@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {"name": "OpenSeeker-v1-Data", "url": "https://huggingface.co/datasets/PolarSeeker/OpenSeeker-v1-Data", "revision": "5970e581dc1548f37d846a1955cb8b651d2b657e", "license": "MIT", "role": "policy_sft"},
+    {"name": "OpenResearcher-Dataset", "url": "https://huggingface.co/datasets/OpenResearcher/OpenResearcher-Dataset", "revision": "bb955d554fc4051a0fe88691b36972a235141941", "license": "MIT", "role": "policy_sft"},
+    {"name": "LRAT-Train", "url": "https://huggingface.co/datasets/Yuqi-Zhou/LRAT-Train", "revision": "26df12d39ec3eb65a30a61d86664931bb0fa4359", "license": "VERIFY_DATASET_CARD", "role": "retriever_only"},
+    {"name": "HotpotQA", "url": "https://github.com/hotpotqa/hotpot", "revision": "3635853403a8735609ee997664e1528f4480762a", "license": "CC BY-SA 4.0", "role": "rl", "data_mirror": "hotpotqa/hotpot_qa", "data_revision": "1908d6afbbead072334abe2965f91bd2709910ab"},
+    {"name": "2WikiMultiHopQA", "url": "https://github.com/Alab-NII/2wikimultihop", "revision": "13800e5be57df1b4040b9b1588c6c811779e69e9", "license": "Apache-2.0", "role": "rl", "data_url": "https://www.dropbox.com/s/npidmtadreo6df2/data.zip"},
+    {"name": "MuSiQue-Ans", "url": "https://github.com/StonyBrookNLP/musique", "revision": "922ac98f19a201998dbdae6d7f2887a5258dbdeb", "license": "CC BY 4.0", "role": "rl", "data_url": "https://drive.google.com/file/d/1tGdADlNjWFaHLeZZGShh2IRcpO6Lv24h"},
+    {"name": "BrowseComp-Plus", "url": "https://github.com/texttron/BrowseComp-Plus", "revision": "046949032b0328319cc9a02663a759ec601d9402", "license": "VERIFY_UPSTREAM", "role": "evaluation_only", "dataset_revision": "144cff8e35b5eaef7e526346aa60774a9deb941f", "corpus_revision": "b27b02bc3e45511b8b82a13e6f90ce761df726f6"},
+    {"name": "xbench-DeepSearch", "url": "https://huggingface.co/datasets/xbench/DeepSearch", "revision": "436bbed79aef5b19c857047650ab528be33c6680", "license": "VERIFY_DATASET_CARD", "role": "chinese_evaluation_only", "decrypt_code_url": "https://github.com/xbench-ai/xbench-evals", "decrypt_code_revision": "17c5621925ff8bc67a113b89ac41fb798b044264"},
+    {"name": "BrowseComp-ZH", "url": "https://huggingface.co/datasets/PALIN2018/BrowseComp-ZH", "revision": "15b7bffc8af684c9b012843fb4f6353838ea3357", "license": "VERIFY_DATASET_CARD", "role": "chinese_evaluation_only"}
+  ]
+}

@@ -1,0 +1,51 @@
+diff --git a/tests/test_fsdp_stats_export.py b/tests/test_fsdp_stats_export.py
+new file mode 100644
+index 0000000..cc7d3a0
+--- /dev/null
++++ b/tests/test_fsdp_stats_export.py
+@@ -0,0 +1,45 @@
++from contextlib import nullcontext
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from areal.engine.fsdp_engine import FSDPEngine
++
++
++def _fake_engine(dp_group, cpu_group):
++    return SimpleNamespace(
++        data_parallel_group=dp_group,
++        cpu_group=cpu_group,
++        _offload_aware_context=nullcontext,
++    )
++
++
++def test_pure_dp_stats_stay_local():
++    dp_group = object()
++    cpu_group = object()
++    engine = _fake_engine(dp_group, cpu_group)
++
++    with (
++        patch(
++            "areal.engine.fsdp_engine.stats_tracker.export_all",
++            return_value={"loss": 1.0},
++        ) as export_all,
++    ):
++        assert FSDPEngine.export_stats(engine) == {"loss": 1.0}
++
++    export_all.assert_called_once_with(reduce_group=None)
++
++
++def test_hybrid_parallel_stats_also_stay_local():
++    dp_group = object()
++    cpu_group = object()
++    engine = _fake_engine(dp_group, cpu_group)
++
++    with (
++        patch(
++            "areal.engine.fsdp_engine.stats_tracker.export_all",
++            return_value={},
++        ) as export_all,
++    ):
++        assert FSDPEngine.export_stats(engine) == {}
++
++    export_all.assert_called_once_with(reduce_group=None)
